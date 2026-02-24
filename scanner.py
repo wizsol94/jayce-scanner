@@ -67,7 +67,7 @@ async def get_top_movers() -> list:
     logger.info(f"   💰 MC: {MIN_MARKET_CAP:,}+ (100K+)")
     logger.info(f"   💧 Liq: {MIN_LIQUIDITY:,}+ (10K+)")
     logger.info(f"   ⛓️ Chain: Solana")
-    logger.info(f"   🏪 DEX: Pump.fun, Pumpswap, Raydium")
+    logger.info(f"   🏪 DEX: Pump.fun, Pumpswap")
     logger.info("=" * 60)
     
     tokens = []
@@ -214,8 +214,8 @@ async def get_top_movers() -> list:
                 if liquidity < MIN_LIQUIDITY:
                     continue
                 
-                # 3. Only Pump.fun, Pumpswap, Raydium (NO Orca, NO others)
-                valid_dex = any(d in dex_id for d in ['pump', 'raydium'])
+                # 3. Only Pump.fun, Pumpswap (NO Raydium, NO Orca, NO others)
+                valid_dex = 'pump' in dex_id
                 if not valid_dex:
                     continue
                 
@@ -588,7 +588,7 @@ async def main():
     logger.info(f"💰 Min market cap: ${MIN_MARKET_CAP:,} (100K+)")
     logger.info(f"💧 Min liquidity: ${MIN_LIQUIDITY:,} (10K+)")
     logger.info(f"⛓️ Chain: Solana only")
-    logger.info(f"🏪 DEX: Pump.fun, Pumpswap, Raydium only")
+    logger.info(f"🏪 DEX: Pump.fun, Pumpswap only")
     logger.info("=" * 60)
     logger.info("")
     
