@@ -53,15 +53,16 @@ TRAINED_SETUPS = {
 
 async def get_top_movers() -> list:
     """
-    Opens Dexscreener with YOUR exact filters and scrapes the top coins.
+    Opens Dexscreener with YOUR exact filters and does YOUR rotation:
     
-    This is EXACTLY what you see when you:
-    1. Open Dexscreener
-    2. Select Solana
-    3. Set MC: 100K+
-    4. Set Liq: 10K+
-    5. Look at Pump.fun, Pumpswap, Raydium coins
-    6. Sort by 5m/1h movers
+    1. Get Top 35 from 5M MOVERS (fast action, new coins popping)
+    2. Get Top 35 from 1H MOVERS (building momentum)
+    3. Combine = 70 unique charts
+    
+    This is EXACTLY what you do:
+    - Click 5M volume to see what's moving NOW
+    - Click 1H volume to see what's building
+    - Rotate all day to catch new coins + steady plays
     """
     
     logger.info("=" * 60)
@@ -70,9 +71,10 @@ async def get_top_movers() -> list:
     logger.info(f"   💧 Liq: {MIN_LIQUIDITY:,}+ (10K+)")
     logger.info(f"   ⛓️ Chain: Solana")
     logger.info(f"   🏪 DEX: Pump.fun, Pumpswap")
+    logger.info(f"   🔄 Rotation: 5M movers + 1H movers (like you do!)")
     logger.info("=" * 60)
     
-    tokens = []
+    all_tokens = {}  # Use dict to avoid duplicates
     
     try:
         async with async_playwright() as p:
@@ -81,91 +83,58 @@ async def get_top_movers() -> list:
             page = await context.new_page()
             
             # ══════════════════════════════════════════════
-            # OPEN DEXSCREENER WITH YOUR FILTERS
+            # ROTATION 1: 5M MOVERS (what's moving RIGHT NOW)
             # ══════════════════════════════════════════════
             
-            # Dexscreener URL with Solana filter and sorting by trending
-            # We'll apply MC and Liq filters after loading
-            dex_url = "https://dexscreener.com/solana?rankBy=trendingScoreH1&order=desc"
+            logger.info("")
+            logger.info("🔥 ROTATION 1: 5M MOVERS (new coins, fast action)")
             
-            logger.info(f"🌐 Loading: {dex_url}")
-            await page.goto(dex_url, wait_until='networkidle', timeout=60000)
-            await asyncio.sleep(5)  # Let page fully load
+            dex_url_5m = "https://dexscreener.com/solana?rankBy=trendingScoreM5&order=desc"
             
-            # ══════════════════════════════════════════════
-            # APPLY YOUR FILTERS (MC and Liquidity)
-            # ══════════════════════════════════════════════
+            logger.info(f"🌐 Loading: {dex_url_5m}")
+            await page.goto(dex_url_5m, wait_until='networkidle', timeout=60000)
+            await asyncio.sleep(5)
             
-            logger.info("⚙️ Applying your filters...")
+            # Apply filters
+            await apply_filters(page)
             
-            try:
-                # Click on Filters button
-                filter_button = await page.query_selector('button:has-text("Filters")')
-                if filter_button:
-                    await filter_button.click()
-                    await asyncio.sleep(1)
-                    
-                    # Set Market Cap minimum
-                    mc_input = await page.query_selector('input[placeholder="Min"][name="marketCap"]')
-                    if mc_input:
-                        await mc_input.fill(str(MIN_MARKET_CAP))
-                    
-                    # Set Liquidity minimum  
-                    liq_input = await page.query_selector('input[placeholder="Min"][name="liquidity"]')
-                    if liq_input:
-                        await liq_input.fill(str(MIN_LIQUIDITY))
-                    
-                    # Apply filters
-                    apply_button = await page.query_selector('button:has-text("Apply")')
-                    if apply_button:
-                        await apply_button.click()
-                        await asyncio.sleep(3)
-                        
-            except Exception as e:
-                logger.warning(f"⚠️ Filter apply issue (will filter manually): {e}")
+            # Scrape 5M movers
+            tokens_5m = await scrape_token_list(page)
+            logger.info(f"   📊 Found {len(tokens_5m)} tokens from 5M movers")
+            
+            for t in tokens_5m:
+                t['source'] = '5M'
+                all_tokens[t['pair_address']] = t
             
             # ══════════════════════════════════════════════
-            # SCRAPE THE TOKEN LIST
+            # ROTATION 2: 1H MOVERS (building momentum)
             # ══════════════════════════════════════════════
             
-            logger.info("📊 Scraping top coins...")
+            logger.info("")
+            logger.info("📈 ROTATION 2: 1H MOVERS (building momentum)")
             
-            # Get all token rows from the table
-            rows = await page.query_selector_all('a[href^="/solana/"]')
+            dex_url_1h = "https://dexscreener.com/solana?rankBy=trendingScoreH1&order=desc"
             
-            logger.info(f"   Found {len(rows)} token links")
+            logger.info(f"🌐 Loading: {dex_url_1h}")
+            await page.goto(dex_url_1h, wait_until='networkidle', timeout=60000)
+            await asyncio.sleep(5)
             
-            seen_addresses = set()
+            # Apply filters
+            await apply_filters(page)
             
-            for row in rows[:150]:  # Check more than needed, we'll filter
-                try:
-                    href = await row.get_attribute('href')
-                    if not href or '/solana/' not in href:
-                        continue
-                    
-                    # Extract pair address from URL
-                    pair_address = href.replace('/solana/', '').split('?')[0].split('#')[0]
-                    
-                    if not pair_address or pair_address in seen_addresses:
-                        continue
-                    
-                    seen_addresses.add(pair_address)
-                    
-                    # Get text content for parsing
-                    text_content = await row.inner_text()
-                    
-                    tokens.append({
-                        'pair_address': pair_address,
-                        'text': text_content,
-                        'url': f"https://dexscreener.com/solana/{pair_address}"
-                    })
-                    
-                except Exception as e:
-                    continue
+            # Scrape 1H movers
+            tokens_1h = await scrape_token_list(page)
+            logger.info(f"   📊 Found {len(tokens_1h)} tokens from 1H movers")
+            
+            for t in tokens_1h:
+                if t['pair_address'] not in all_tokens:  # Don't overwrite 5M entries
+                    t['source'] = '1H'
+                    all_tokens[t['pair_address']] = t
             
             await browser.close()
             
-            logger.info(f"📋 Scraped {len(tokens)} unique tokens")
+            logger.info("")
+            logger.info(f"📋 Total unique tokens from rotation: {len(all_tokens)}")
             
     except Exception as e:
         logger.error(f"❌ Dexscreener scrape error: {e}")
@@ -182,10 +151,8 @@ async def get_top_movers() -> list:
     filtered_tokens = []
     
     async with httpx.AsyncClient(timeout=30) as client:
-        for i, token in enumerate(tokens):
+        for pair_address, token in all_tokens.items():
             try:
-                pair_address = token['pair_address']
-                
                 # Get pair info from API
                 api_url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
                 response = await client.get(api_url)
@@ -242,7 +209,8 @@ async def get_top_movers() -> list:
                     'price_change_24h': price_change_24h,
                     'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
                     'dex': dex_id,
-                    'url': f"https://dexscreener.com/solana/{pair_address}"
+                    'url': f"https://dexscreener.com/solana/{pair_address}",
+                    'source': token.get('source', '?')
                 }
                 
                 filtered_tokens.append(token_info)
@@ -277,12 +245,85 @@ async def get_top_movers() -> list:
         mc_str = f"{token['market_cap']/1000:.0f}K" if token['market_cap'] < 1_000_000 else f"{token['market_cap']/1_000_000:.1f}M"
         liq_str = f"{token['liquidity']/1000:.0f}K" if token['liquidity'] < 1_000_000 else f"{token['liquidity']/1_000_000:.1f}M"
         
-        logger.info(f"   {i+1:2}. {token['symbol']:12} | MC: {mc_str:8} | Liq: {liq_str:8} | 1h: {token['price_change_1h']:+6.1f}% | 5m: {token['price_change_5m']:+6.1f}% | {token['dex']}")
+        logger.info(f"   {i+1:2}. {token['symbol']:12} | MC: {mc_str:8} | Liq: {liq_str:8} | 1h: {token['price_change_1h']:+6.1f}% | 5m: {token['price_change_5m']:+6.1f}% | {token['dex']} | {token['source']}")
     
     logger.info("=" * 60)
     logger.info("")
     
     return filtered_tokens
+
+
+async def apply_filters(page):
+    """Apply MC and Liquidity filters on Dexscreener."""
+    try:
+        logger.info("⚙️ Applying your filters...")
+        
+        # Click on Filters button
+        filter_button = await page.query_selector('button:has-text("Filters")')
+        if filter_button:
+            await filter_button.click()
+            await asyncio.sleep(1)
+            
+            # Set Market Cap minimum
+            mc_input = await page.query_selector('input[placeholder="Min"][name="marketCap"]')
+            if mc_input:
+                await mc_input.fill(str(MIN_MARKET_CAP))
+            
+            # Set Liquidity minimum  
+            liq_input = await page.query_selector('input[placeholder="Min"][name="liquidity"]')
+            if liq_input:
+                await liq_input.fill(str(MIN_LIQUIDITY))
+            
+            # Apply filters
+            apply_button = await page.query_selector('button:has-text("Apply")')
+            if apply_button:
+                await apply_button.click()
+                await asyncio.sleep(3)
+                
+    except Exception as e:
+        logger.warning(f"⚠️ Filter apply issue (will filter manually): {e}")
+
+
+async def scrape_token_list(page) -> list:
+    """Scrape token list from current Dexscreener page."""
+    tokens = []
+    
+    try:
+        logger.info("📊 Scraping coins...")
+        
+        # Get all token rows from the table
+        rows = await page.query_selector_all('a[href^="/solana/"]')
+        
+        logger.info(f"   Found {len(rows)} token links")
+        
+        seen_addresses = set()
+        
+        for row in rows[:100]:  # Check top 100, will filter later
+            try:
+                href = await row.get_attribute('href')
+                if not href or '/solana/' not in href:
+                    continue
+                
+                # Extract pair address from URL
+                pair_address = href.replace('/solana/', '').split('?')[0].split('#')[0]
+                
+                if not pair_address or pair_address in seen_addresses:
+                    continue
+                
+                seen_addresses.add(pair_address)
+                
+                tokens.append({
+                    'pair_address': pair_address,
+                    'url': f"https://dexscreener.com/solana/{pair_address}"
+                })
+                
+            except Exception as e:
+                continue
+                
+    except Exception as e:
+        logger.error(f"❌ Scrape error: {e}")
+    
+    return tokens
 
 
 # ══════════════════════════════════════════════
