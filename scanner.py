@@ -8,6 +8,8 @@ from datetime import datetime
 from telegram import Bot
 from telegram.constants import ParseMode
 from playwright.async_api import async_playwright
+from PIL import Image, ImageDraw, ImageFont
+from io import BytesIO
 
 # ══════════════════════════════════════════════
 # LOGGING
@@ -342,6 +344,149 @@ async def screenshot_chart(pair_address: str, max_retries: int = 2) -> bytes:
 
 
 # ══════════════════════════════════════════════
+# CHART ANNOTATION - Draw like Wiz flash cards
+# ══════════════════════════════════════════════
+
+def annotate_chart(image_bytes: bytes, analysis: dict) -> bytes:
+    """
+    Draw annotations on the chart like Wiz Theory flash cards:
+    - BREAKOUT label with arrow
+    - FLIP ZONE box (cyan/teal)
+    - ENTRY point
+    - Fib level label
+    - Setup type label
+    """
+    
+    try:
+        # Load image
+        img = Image.open(BytesIO(image_bytes))
+        draw = ImageDraw.Draw(img)
+        
+        width, height = img.size
+        
+        # Get annotation coordinates from analysis
+        annotations = analysis.get('annotations', {})
+        setup_type = analysis.get('setup_type', 'Setup')
+        fib_level = analysis.get('fib_level', '')
+        confidence = analysis.get('confidence', 0)
+        
+        # Default positions if not provided
+        breakout_x = int(annotations.get('breakout_x', 30) * width / 100)
+        breakout_y = int(annotations.get('breakout_y', 25) * height / 100)
+        entry_x = int(annotations.get('entry_x', 85) * width / 100)
+        entry_y = int(annotations.get('entry_y', 60) * height / 100)
+        flip_zone_top = int(annotations.get('flip_zone_top_y', 55) * height / 100)
+        flip_zone_bottom = int(annotations.get('flip_zone_bottom_y', 65) * height / 100)
+        
+        # Colors (matching your flash cards)
+        CYAN = (0, 255, 255)
+        MAGENTA = (255, 0, 255)
+        GREEN = (0, 255, 0)
+        RED = (255, 50, 50)
+        WHITE = (255, 255, 255)
+        YELLOW = (255, 255, 0)
+        
+        # Try to load a font, fall back to default
+        try:
+            font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+            font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+        except:
+            font_large = ImageFont.load_default()
+            font_medium = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+        
+        # ══════════════════════════════════════════════
+        # 1. FLIP ZONE BOX (Cyan/Teal semi-transparent)
+        # ══════════════════════════════════════════════
+        
+        # Draw flip zone rectangle across the chart
+        flip_zone_left = int(width * 0.15)
+        flip_zone_right = int(width * 0.95)
+        
+        # Draw multiple lines to create a "zone" effect
+        for i in range(3):
+            offset = i * 2
+            draw.rectangle(
+                [flip_zone_left, flip_zone_top + offset, flip_zone_right, flip_zone_bottom - offset],
+                outline=CYAN,
+                width=2
+            )
+        
+        # Fill with semi-transparent effect (draw lines)
+        for y in range(flip_zone_top, flip_zone_bottom, 4):
+            draw.line([(flip_zone_left, y), (flip_zone_right, y)], fill=(0, 200, 200, 50), width=1)
+        
+        # FLIP ZONE label
+        draw.rectangle([flip_zone_left, flip_zone_bottom, flip_zone_left + 100, flip_zone_bottom + 25], fill=CYAN)
+        draw.text((flip_zone_left + 5, flip_zone_bottom + 3), "FLIP ZONE", fill=(0, 0, 0), font=font_medium)
+        
+        # ══════════════════════════════════════════════
+        # 2. BREAKOUT label with line
+        # ══════════════════════════════════════════════
+        
+        # Draw breakout marker
+        draw.rectangle([breakout_x - 60, breakout_y - 25, breakout_x + 60, breakout_y], fill=MAGENTA)
+        draw.text((breakout_x - 50, breakout_y - 22), "BREAKOUT", fill=WHITE, font=font_medium)
+        
+        # Arrow pointing down from breakout
+        draw.line([(breakout_x, breakout_y), (breakout_x, breakout_y + 30)], fill=MAGENTA, width=3)
+        draw.polygon([(breakout_x - 8, breakout_y + 25), (breakout_x + 8, breakout_y + 25), (breakout_x, breakout_y + 40)], fill=MAGENTA)
+        
+        # ══════════════════════════════════════════════
+        # 3. ENTRY point
+        # ══════════════════════════════════════════════
+        
+        # Entry label box
+        draw.rectangle([entry_x - 40, entry_y - 12, entry_x + 40, entry_y + 12], fill=GREEN)
+        draw.text((entry_x - 30, entry_y - 9), "ENTRY", fill=(0, 0, 0), font=font_medium)
+        
+        # Arrow pointing to entry
+        draw.line([(entry_x + 45, entry_y), (entry_x + 70, entry_y)], fill=GREEN, width=3)
+        draw.polygon([(entry_x + 40, entry_y - 6), (entry_x + 40, entry_y + 6), (entry_x + 50, entry_y)], fill=GREEN)
+        
+        # ══════════════════════════════════════════════
+        # 4. Setup info box (top left corner)
+        # ══════════════════════════════════════════════
+        
+        # Background box
+        info_box_height = 100
+        draw.rectangle([10, 10, 280, 10 + info_box_height], fill=(0, 0, 0, 200), outline=CYAN, width=2)
+        
+        # Setup type
+        draw.text((20, 15), f"• {setup_type.upper()}", fill=CYAN, font=font_large)
+        
+        # Additional info
+        draw.text((20, 45), f"• CLEAN STRUCTURE", fill=GREEN, font=font_small)
+        draw.text((20, 65), f"• {confidence}% MATCH", fill=YELLOW, font=font_small)
+        draw.text((20, 85), f"• FIB: {fib_level}", fill=WHITE, font=font_small)
+        
+        # ══════════════════════════════════════════════
+        # 5. Fib level line
+        # ══════════════════════════════════════════════
+        
+        # Draw a horizontal dashed line at entry level
+        for x in range(0, width, 20):
+            draw.line([(x, entry_y), (x + 10, entry_y)], fill=YELLOW, width=2)
+        
+        # Fib label on right side
+        draw.rectangle([width - 80, entry_y - 12, width - 10, entry_y + 12], fill=(50, 50, 50))
+        draw.text((width - 75, entry_y - 9), fib_level, fill=YELLOW, font=font_medium)
+        
+        # Save annotated image
+        output = BytesIO()
+        img.save(output, format='PNG')
+        output.seek(0)
+        
+        logger.info("   🎨 Chart annotated!")
+        return output.getvalue()
+        
+    except Exception as e:
+        logger.error(f"   ❌ Annotation error: {e}")
+        return image_bytes  # Return original if annotation fails
+
+
+# ══════════════════════════════════════════════
 # VISION ANALYSIS
 # ══════════════════════════════════════════════
 
@@ -383,6 +528,14 @@ IMPORTANT:
 - Do NOT flag if no clear structure
 - Do NOT flag choppy/messy charts
 
+For the chart annotations, estimate these positions as PERCENTAGES of the image (0-100):
+- breakout_x: horizontal position of the breakout/impulse peak (0=left, 100=right)
+- breakout_y: vertical position of the breakout peak (0=top, 100=bottom)
+- entry_x: horizontal position where entry would be (usually right side, 80-95)
+- entry_y: vertical position of the entry/flip zone level
+- flip_zone_top_y: top of the flip zone (percentage from top)
+- flip_zone_bottom_y: bottom of the flip zone (percentage from top)
+
 Respond in this exact JSON format:
 {
     "setup_detected": true/false,
@@ -392,7 +545,15 @@ Respond in this exact JSON format:
     "pullback_active": true/false,
     "fib_level": ".618" (or other),
     "notes": "brief description of what you see",
-    "timeframe_recommendation": "1M" or "5M"
+    "timeframe_recommendation": "1M" or "5M",
+    "annotations": {
+        "breakout_x": 30,
+        "breakout_y": 20,
+        "entry_x": 85,
+        "entry_y": 60,
+        "flip_zone_top_y": 55,
+        "flip_zone_bottom_y": 65
+    }
 }
 
 Only return the JSON, nothing else."""
@@ -477,6 +638,12 @@ async def send_alert(token_info: dict, analysis: dict, image_bytes: bytes):
         liq = token_info['liquidity']
         liq_str = f"{liq/1_000_000:.1f}M" if liq >= 1_000_000 else f"{liq/1_000:.0f}K"
         
+        # ══════════════════════════════════════════════
+        # ANNOTATE THE CHART like Wiz flash cards
+        # ══════════════════════════════════════════════
+        logger.info(f"   🎨 Annotating chart...")
+        annotated_image = annotate_chart(image_bytes, analysis)
+        
         # Alert message (emoji rich!)
         message = f"""🔮 SETUP FORMING 🔥
 
@@ -497,9 +664,9 @@ async def send_alert(token_info: dict, analysis: dict, image_bytes: bytes):
 
 ⏰ {datetime.now().strftime('%I:%M %p')}"""
 
-        # Send photo
+        # Send photo with annotations
         from io import BytesIO
-        photo = BytesIO(image_bytes)
+        photo = BytesIO(annotated_image)
         photo.name = 'chart.png'
         
         await bot.send_photo(
@@ -658,8 +825,27 @@ async def send_test_alert():
 ✅ If you see this, Jayce Scanner alerts are working!"""
 
         if image_bytes:
+            # Create fake analysis for annotation test
+            fake_analysis = {
+                'setup_type': '618 + Flip Zone',
+                'confidence': 85,
+                'fib_level': '.618',
+                'annotations': {
+                    'breakout_x': 25,
+                    'breakout_y': 20,
+                    'entry_x': 80,
+                    'entry_y': 55,
+                    'flip_zone_top_y': 50,
+                    'flip_zone_bottom_y': 60
+                }
+            }
+            
+            # Annotate the chart like Wiz flash cards
+            logger.info("🎨 Annotating test chart...")
+            annotated_image = annotate_chart(image_bytes, fake_analysis)
+            
             from io import BytesIO
-            photo = BytesIO(image_bytes)
+            photo = BytesIO(annotated_image)
             photo.name = 'chart.png'
             
             await bot.send_photo(
