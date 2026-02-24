@@ -188,6 +188,9 @@ async def get_top_movers() -> list:
                 api_url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
                 response = await client.get(api_url)
                 
+                # Rate limit - wait 100ms between calls to avoid 429
+                await asyncio.sleep(0.1)
+                
                 if response.status_code != 200:
                     continue
                 
