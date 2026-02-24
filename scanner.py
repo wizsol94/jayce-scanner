@@ -289,7 +289,7 @@ async def screenshot_chart(pair_address: str, max_retries: int = 2) -> bytes:
     Take a screenshot of the chart from Dexscreener.
     Uses 5M timeframe for cleaner view.
     
-    - 60 second timeout (increased from 30s)
+    - 90 second timeout (optimized for reliability)
     - Retry logic (tries up to 2 times if first attempt fails)
     """
     
@@ -306,9 +306,9 @@ async def screenshot_chart(pair_address: str, max_retries: int = 2) -> bytes:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page(viewport={'width': 1280, 'height': 720})
                 
-                # Increased timeout to 60 seconds
-                await page.goto(url, wait_until='networkidle', timeout=60000)
-                await asyncio.sleep(3)
+                # 90 second timeout - optimized for reliability
+                await page.goto(url, wait_until='domcontentloaded', timeout=90000)
+                await asyncio.sleep(5)  # Give chart time to render
                 
                 # Try to click 5m timeframe for cleaner view
                 try:
@@ -330,7 +330,7 @@ async def screenshot_chart(pair_address: str, max_retries: int = 2) -> bytes:
             logger.error(f"   ❌ Screenshot error (attempt {attempt + 1}): {e}")
             
             if attempt < max_retries - 1:
-                await asyncio.sleep(2)  # Wait before retry
+                await asyncio.sleep(3)  # Wait before retry
                 continue
             else:
                 return None
