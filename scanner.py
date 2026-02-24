@@ -284,43 +284,58 @@ async def get_top_movers() -> list:
 # CHART SCREENSHOT
 # ══════════════════════════════════════════════
 
-async def screenshot_chart(pair_address: str) -> bytes:
+async def screenshot_chart(pair_address: str, max_retries: int = 2) -> bytes:
     """
     Take a screenshot of the chart from Dexscreener.
     Uses 5M timeframe for cleaner view.
+    
+    - 60 second timeout (increased from 30s)
+    - Retry logic (tries up to 2 times if first attempt fails)
     """
     
     url = f"https://dexscreener.com/solana/{pair_address}"
     
-    logger.info(f"   📸 Screenshotting chart...")
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                logger.info(f"   🔄 Retry attempt {attempt + 1}...")
+            else:
+                logger.info(f"   📸 Screenshotting chart...")
+            
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page(viewport={'width': 1280, 'height': 720})
+                
+                # Increased timeout to 60 seconds
+                await page.goto(url, wait_until='networkidle', timeout=60000)
+                await asyncio.sleep(3)
+                
+                # Try to click 5m timeframe for cleaner view
+                try:
+                    tf_button = await page.query_selector('button:has-text("5m")')
+                    if tf_button:
+                        await tf_button.click()
+                        await asyncio.sleep(2)
+                except:
+                    pass
+                
+                # Screenshot
+                screenshot = await page.screenshot(type='png')
+                
+                await browser.close()
+                
+                return screenshot
+                
+        except Exception as e:
+            logger.error(f"   ❌ Screenshot error (attempt {attempt + 1}): {e}")
+            
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)  # Wait before retry
+                continue
+            else:
+                return None
     
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page(viewport={'width': 1280, 'height': 720})
-            
-            await page.goto(url, wait_until='networkidle', timeout=30000)
-            await asyncio.sleep(3)
-            
-            # Try to click 5m timeframe for cleaner view
-            try:
-                tf_button = await page.query_selector('button:has-text("5m")')
-                if tf_button:
-                    await tf_button.click()
-                    await asyncio.sleep(2)
-            except:
-                pass
-            
-            # Screenshot
-            screenshot = await page.screenshot(type='png')
-            
-            await browser.close()
-            
-            return screenshot
-            
-    except Exception as e:
-        logger.error(f"   ❌ Screenshot error: {e}")
-        return None
+    return None
 
 
 # ══════════════════════════════════════════════
