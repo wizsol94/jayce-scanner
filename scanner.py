@@ -579,6 +579,109 @@ async def run_scan():
     logger.info("=" * 60)
 
 
+# ══════════════════════════════════════════════
+# TEST ALERT - Send a fake alert to test Telegram
+# ══════════════════════════════════════════════
+
+async def send_test_alert():
+    """
+    Send a test alert to verify Telegram is working.
+    Takes a real screenshot of a trending coin.
+    """
+    
+    logger.info("")
+    logger.info("🧪" + "=" * 58)
+    logger.info("🧪 SENDING TEST ALERT")
+    logger.info("🧪" + "=" * 58)
+    logger.info("")
+    
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("❌ Telegram credentials not set")
+        return
+    
+    try:
+        # Get a real coin to screenshot
+        logger.info("📡 Getting a trending coin...")
+        
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get("https://api.dexscreener.com/latest/dex/search?q=pumpswap")
+            data = response.json()
+            
+            if data.get('pairs') and len(data['pairs']) > 0:
+                pair = data['pairs'][0]
+                pair_address = pair.get('pairAddress', '')
+                symbol = pair.get('baseToken', {}).get('symbol', 'TEST')
+                market_cap = float(pair.get('marketCap', 0) or 150000)
+                liquidity = float(pair.get('liquidity', {}).get('usd', 0) or 25000)
+            else:
+                # Fallback
+                pair_address = ''
+                symbol = 'TEST'
+                market_cap = 150000
+                liquidity = 25000
+        
+        # Take screenshot
+        logger.info("📸 Taking screenshot...")
+        image_bytes = None
+        
+        if pair_address:
+            image_bytes = await screenshot_chart(pair_address)
+        
+        # Create test alert
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        
+        mc_str = f"{market_cap/1000:.0f}K" if market_cap < 1_000_000 else f"{market_cap/1_000_000:.1f}M"
+        liq_str = f"{liquidity/1000:.0f}K" if liquidity < 1_000_000 else f"{liquidity/1_000_000:.1f}M"
+        
+        message = f"""🧪 TEST ALERT 🧪
+
+🔮 SETUP FORMING 🔥
+
+🪙 ${symbol} · 💰 {mc_str} MC · 💧 {liq_str} Liq
+
+📐 618 + Flip Zone | 5M
+
+🧠 Pattern Match
+✅ 61 trained setups · 85% match
+📈 Your avg: +95%
+
+⚡ Conditions
+🏗️ Clean Structure
+
+📝 This is a TEST ALERT to verify your scanner is working correctly!
+
+🔗 [View on Dexscreener](https://dexscreener.com/solana/{pair_address})
+
+⏰ {datetime.now().strftime('%I:%M %p')}
+
+✅ If you see this, Jayce Scanner alerts are working!"""
+
+        if image_bytes:
+            from io import BytesIO
+            photo = BytesIO(image_bytes)
+            photo.name = 'chart.png'
+            
+            await bot.send_photo(
+                chat_id=TELEGRAM_CHAT_ID,
+                photo=photo,
+                caption=message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        
+        logger.info("✅ Test alert sent!")
+        logger.info("")
+        
+    except Exception as e:
+        logger.error(f"❌ Test alert error: {e}")
+
+
 async def main():
     """Main loop - runs scans every X minutes."""
     
@@ -601,6 +704,12 @@ async def main():
     subprocess.run(['playwright', 'install', 'chromium'], check=True)
     logger.info("✅ Browsers ready")
     logger.info("")
+    
+    # Check for TEST_ALERT environment variable
+    if os.getenv('SEND_TEST_ALERT', '').lower() == 'true':
+        await send_test_alert()
+        logger.info("🧪 Test alert sent. Set SEND_TEST_ALERT=false to disable.")
+        logger.info("")
     
     while True:
         try:
