@@ -1,12 +1,13 @@
 import os
 import asyncio
 import logging
-import httpx
 import base64
 import anthropic
+import json
 from datetime import datetime
 from telegram import Bot
 from telegram.constants import ParseMode
+from playwright.async_api import async_playwright
 
 # ══════════════════════════════════════════════
 # LOGGING
@@ -29,9 +30,9 @@ SCAN_INTERVAL_MINUTES = int(os.getenv('SCAN_INTERVAL_MINUTES', 10))
 CHARTS_PER_SCAN = int(os.getenv('CHARTS_PER_SCAN', 70))
 MIN_MATCH_PERCENT = int(os.getenv('MIN_MATCH_PERCENT', 70))
 
-# Dexscreener filters
-MIN_MARKET_CAP = int(os.getenv('MIN_MARKET_CAP', 100000))
-MIN_LIQUIDITY = int(os.getenv('MIN_LIQUIDITY', 10000))
+# Dexscreener filters (YOUR exact filters)
+MIN_MARKET_CAP = int(os.getenv('MIN_MARKET_CAP', 100000))  # 100K+
+MIN_LIQUIDITY = int(os.getenv('MIN_LIQUIDITY', 10000))      # 10K+
 
 # ══════════════════════════════════════════════
 # YOUR TRAINED SETUPS (from your 219 charts)
@@ -45,121 +46,253 @@ TRAINED_SETUPS = {
 }
 
 # ══════════════════════════════════════════════
-# DEXSCREENER API
+# DEXSCREENER SCRAPER - YOUR EXACT VIEW
 # ══════════════════════════════════════════════
 
 async def get_top_movers() -> list:
     """
-    Pull top movers from Dexscreener with your filters.
+    Opens Dexscreener with YOUR exact filters and scrapes the top coins.
     
-    Filters:
-    - Solana only
-    - 100K+ Market Cap
-    - 10K+ Liquidity
-    - Sorted by recent activity
+    This is EXACTLY what you see when you:
+    1. Open Dexscreener
+    2. Select Solana
+    3. Set MC: 100K+
+    4. Set Liq: 10K+
+    5. Look at Pump.fun, Pumpswap, Raydium coins
+    6. Sort by 5m/1h movers
     """
-    logger.info(f"🔍 Pulling top {CHARTS_PER_SCAN} movers from Dexscreener...")
+    
+    logger.info("=" * 60)
+    logger.info("🔍 Opening Dexscreener with YOUR filters...")
+    logger.info(f"   💰 MC: {MIN_MARKET_CAP:,}+ (100K+)")
+    logger.info(f"   💧 Liq: {MIN_LIQUIDITY:,}+ (10K+)")
+    logger.info(f"   ⛓️ Chain: Solana")
+    logger.info(f"   🏪 DEX: Pump.fun, Pumpswap, Raydium")
+    logger.info("=" * 60)
+    
+    tokens = []
     
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            # Dexscreener API - get Solana tokens sorted by volume
-            url = "https://api.dexscreener.com/latest/dex/tokens/solana"
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
+            page = await context.new_page()
             
-            # Get trending/boosted tokens on Solana
-            trending_url = "https://api.dexscreener.com/token-boosts/top/v1"
+            # ══════════════════════════════════════════════
+            # OPEN DEXSCREENER WITH YOUR FILTERS
+            # ══════════════════════════════════════════════
             
-            response = await client.get(trending_url)
+            # Dexscreener URL with Solana filter and sorting by trending
+            # We'll apply MC and Liq filters after loading
+            dex_url = "https://dexscreener.com/solana?rankBy=trendingScoreH1&order=desc"
             
-            tokens = []
+            logger.info(f"🌐 Loading: {dex_url}")
+            await page.goto(dex_url, wait_until='networkidle', timeout=60000)
+            await asyncio.sleep(5)  # Let page fully load
             
-            if response.status_code == 200:
-                data = response.json()
-                
-                for item in data:
-                    # Filter for Solana only
-                    if item.get('chainId') != 'solana':
+            # ══════════════════════════════════════════════
+            # APPLY YOUR FILTERS (MC and Liquidity)
+            # ══════════════════════════════════════════════
+            
+            logger.info("⚙️ Applying your filters...")
+            
+            try:
+                # Click on Filters button
+                filter_button = await page.query_selector('button:has-text("Filters")')
+                if filter_button:
+                    await filter_button.click()
+                    await asyncio.sleep(1)
+                    
+                    # Set Market Cap minimum
+                    mc_input = await page.query_selector('input[placeholder="Min"][name="marketCap"]')
+                    if mc_input:
+                        await mc_input.fill(str(MIN_MARKET_CAP))
+                    
+                    # Set Liquidity minimum  
+                    liq_input = await page.query_selector('input[placeholder="Min"][name="liquidity"]')
+                    if liq_input:
+                        await liq_input.fill(str(MIN_LIQUIDITY))
+                    
+                    # Apply filters
+                    apply_button = await page.query_selector('button:has-text("Apply")')
+                    if apply_button:
+                        await apply_button.click()
+                        await asyncio.sleep(3)
+                        
+            except Exception as e:
+                logger.warning(f"⚠️ Filter apply issue (will filter manually): {e}")
+            
+            # ══════════════════════════════════════════════
+            # SCRAPE THE TOKEN LIST
+            # ══════════════════════════════════════════════
+            
+            logger.info("📊 Scraping top coins...")
+            
+            # Get all token rows from the table
+            rows = await page.query_selector_all('a[href^="/solana/"]')
+            
+            logger.info(f"   Found {len(rows)} token links")
+            
+            seen_addresses = set()
+            
+            for row in rows[:150]:  # Check more than needed, we'll filter
+                try:
+                    href = await row.get_attribute('href')
+                    if not href or '/solana/' not in href:
                         continue
                     
-                    token_address = item.get('tokenAddress')
-                    if token_address:
-                        tokens.append(token_address)
-                
-                logger.info(f"📊 Found {len(tokens)} trending Solana tokens")
-            
-            # Now get detailed info for each token
-            filtered_tokens = []
-            
-            for token_address in tokens[:100]:  # Check top 100
-                try:
-                    detail_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
-                    detail_response = await client.get(detail_url)
+                    # Extract pair address from URL
+                    pair_address = href.replace('/solana/', '').split('?')[0].split('#')[0]
                     
-                    if detail_response.status_code == 200:
-                        detail_data = detail_response.json()
-                        pairs = detail_data.get('pairs', [])
-                        
-                        if pairs:
-                            pair = pairs[0]  # Get first/main pair
-                            
-                            # Extract data
-                            market_cap = float(pair.get('marketCap', 0) or 0)
-                            liquidity = float(pair.get('liquidity', {}).get('usd', 0) or 0)
-                            
-                            # Apply YOUR filters
-                            if market_cap >= MIN_MARKET_CAP and liquidity >= MIN_LIQUIDITY:
-                                token_info = {
-                                    'name': pair.get('baseToken', {}).get('name', 'Unknown'),
-                                    'symbol': pair.get('baseToken', {}).get('symbol', '???'),
-                                    'address': token_address,
-                                    'pair_address': pair.get('pairAddress', ''),
-                                    'market_cap': market_cap,
-                                    'liquidity': liquidity,
-                                    'price_usd': pair.get('priceUsd', '0'),
-                                    'price_change_5m': pair.get('priceChange', {}).get('m5', 0),
-                                    'price_change_1h': pair.get('priceChange', {}).get('h1', 0),
-                                    'price_change_24h': pair.get('priceChange', {}).get('h24', 0),
-                                    'volume_24h': pair.get('volume', {}).get('h24', 0),
-                                    'dex': pair.get('dexId', 'unknown'),
-                                    'url': pair.get('url', f'https://dexscreener.com/solana/{token_address}')
-                                }
-                                
-                                # Only include pump.fun, pumpswap, raydium
-                                dex = token_info['dex'].lower()
-                                if any(d in dex for d in ['pump', 'raydium', 'orca']):
-                                    filtered_tokens.append(token_info)
-                                    
-                                    if len(filtered_tokens) >= CHARTS_PER_SCAN:
-                                        break
+                    if not pair_address or pair_address in seen_addresses:
+                        continue
                     
-                    # Small delay to avoid rate limits
-                    await asyncio.sleep(0.1)
+                    seen_addresses.add(pair_address)
+                    
+                    # Get text content for parsing
+                    text_content = await row.inner_text()
+                    
+                    tokens.append({
+                        'pair_address': pair_address,
+                        'text': text_content,
+                        'url': f"https://dexscreener.com/solana/{pair_address}"
+                    })
                     
                 except Exception as e:
-                    logger.error(f"Error fetching token {token_address}: {e}")
                     continue
             
-            logger.info(f"✅ Filtered to {len(filtered_tokens)} tokens matching your criteria")
-            return filtered_tokens
+            await browser.close()
+            
+            logger.info(f"📋 Scraped {len(tokens)} unique tokens")
             
     except Exception as e:
-        logger.error(f"❌ Dexscreener API error: {e}")
+        logger.error(f"❌ Dexscreener scrape error: {e}")
         return []
+    
+    # ══════════════════════════════════════════════
+    # GET DETAILED INFO VIA API FOR EACH TOKEN
+    # ══════════════════════════════════════════════
+    
+    logger.info("📡 Fetching detailed info for each token...")
+    
+    import httpx
+    
+    filtered_tokens = []
+    
+    async with httpx.AsyncClient(timeout=30) as client:
+        for i, token in enumerate(tokens):
+            try:
+                pair_address = token['pair_address']
+                
+                # Get pair info from API
+                api_url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
+                response = await client.get(api_url)
+                
+                if response.status_code != 200:
+                    continue
+                
+                data = response.json()
+                pair = data.get('pair') or (data.get('pairs', [None])[0])
+                
+                if not pair:
+                    continue
+                
+                # Extract data
+                market_cap = float(pair.get('marketCap', 0) or 0)
+                liquidity = float(pair.get('liquidity', {}).get('usd', 0) or 0)
+                dex_id = pair.get('dexId', '').lower()
+                
+                # ══════════════════════════════════════════════
+                # YOUR FILTERS - STRICT
+                # ══════════════════════════════════════════════
+                
+                # 1. MC must be 100K+
+                if market_cap < MIN_MARKET_CAP:
+                    continue
+                
+                # 2. Liquidity must be 10K+
+                if liquidity < MIN_LIQUIDITY:
+                    continue
+                
+                # 3. Only Pump.fun, Pumpswap, Raydium (NO Orca, NO others)
+                valid_dex = any(d in dex_id for d in ['pump', 'raydium'])
+                if not valid_dex:
+                    continue
+                
+                # Get price changes
+                price_change_5m = float(pair.get('priceChange', {}).get('m5', 0) or 0)
+                price_change_1h = float(pair.get('priceChange', {}).get('h1', 0) or 0)
+                price_change_24h = float(pair.get('priceChange', {}).get('h24', 0) or 0)
+                
+                token_info = {
+                    'name': pair.get('baseToken', {}).get('name', 'Unknown'),
+                    'symbol': pair.get('baseToken', {}).get('symbol', '???'),
+                    'address': pair.get('baseToken', {}).get('address', ''),
+                    'pair_address': pair_address,
+                    'market_cap': market_cap,
+                    'liquidity': liquidity,
+                    'price_usd': pair.get('priceUsd', '0'),
+                    'price_change_5m': price_change_5m,
+                    'price_change_1h': price_change_1h,
+                    'price_change_24h': price_change_24h,
+                    'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
+                    'dex': dex_id,
+                    'url': f"https://dexscreener.com/solana/{pair_address}"
+                }
+                
+                filtered_tokens.append(token_info)
+                
+                await asyncio.sleep(0.05)  # Rate limit
+                
+            except Exception as e:
+                continue
+    
+    # ══════════════════════════════════════════════
+    # SORT BY MOVERS (5m + 1h activity)
+    # ══════════════════════════════════════════════
+    
+    filtered_tokens.sort(
+        key=lambda x: abs(x.get('price_change_1h', 0)) + abs(x.get('price_change_5m', 0)),
+        reverse=True
+    )
+    
+    # Take top X
+    filtered_tokens = filtered_tokens[:CHARTS_PER_SCAN]
+    
+    # ══════════════════════════════════════════════
+    # LOG ALL COINS BEING SCANNED (for you to verify)
+    # ══════════════════════════════════════════════
+    
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info(f"📊 TOP {len(filtered_tokens)} COINS TO SCAN:")
+    logger.info("=" * 60)
+    
+    for i, token in enumerate(filtered_tokens):
+        mc_str = f"{token['market_cap']/1000:.0f}K" if token['market_cap'] < 1_000_000 else f"{token['market_cap']/1_000_000:.1f}M"
+        liq_str = f"{token['liquidity']/1000:.0f}K" if token['liquidity'] < 1_000_000 else f"{token['liquidity']/1_000_000:.1f}M"
+        
+        logger.info(f"   {i+1:2}. {token['symbol']:12} | MC: {mc_str:8} | Liq: {liq_str:8} | 1h: {token['price_change_1h']:+6.1f}% | 5m: {token['price_change_5m']:+6.1f}% | {token['dex']}")
+    
+    logger.info("=" * 60)
+    logger.info("")
+    
+    return filtered_tokens
 
 
 # ══════════════════════════════════════════════
 # CHART SCREENSHOT
 # ══════════════════════════════════════════════
 
-async def screenshot_chart(token_address: str, pair_address: str = None) -> bytes:
+async def screenshot_chart(pair_address: str) -> bytes:
     """
     Take a screenshot of the chart from Dexscreener.
-    Returns image bytes.
+    Uses 5M timeframe for cleaner view.
     """
-    from playwright.async_api import async_playwright
     
-    url = f"https://dexscreener.com/solana/{pair_address or token_address}"
+    url = f"https://dexscreener.com/solana/{pair_address}"
     
-    logger.info(f"📸 Screenshotting: {url}")
+    logger.info(f"   📸 Screenshotting chart...")
     
     try:
         async with async_playwright() as p:
@@ -167,27 +300,26 @@ async def screenshot_chart(token_address: str, pair_address: str = None) -> byte
             page = await browser.new_page(viewport={'width': 1280, 'height': 720})
             
             await page.goto(url, wait_until='networkidle', timeout=30000)
-            
-            # Wait for chart to load
             await asyncio.sleep(3)
             
-            # Try to click on 5m timeframe if available
+            # Try to click 5m timeframe for cleaner view
             try:
-                await page.click('text="5m"', timeout=2000)
-                await asyncio.sleep(1)
+                tf_button = await page.query_selector('button:has-text("5m")')
+                if tf_button:
+                    await tf_button.click()
+                    await asyncio.sleep(2)
             except:
-                pass  # Keep default timeframe
+                pass
             
-            # Screenshot the chart area
+            # Screenshot
             screenshot = await page.screenshot(type='png')
             
             await browser.close()
             
-            logger.info(f"✅ Screenshot captured")
             return screenshot
             
     except Exception as e:
-        logger.error(f"❌ Screenshot error: {e}")
+        logger.error(f"   ❌ Screenshot error: {e}")
         return None
 
 
@@ -197,18 +329,18 @@ async def screenshot_chart(token_address: str, pair_address: str = None) -> byte
 
 async def analyze_chart(image_bytes: bytes, token_info: dict) -> dict:
     """
-    Use Claude Vision to analyze the chart for setups.
+    Use Claude Vision to analyze the chart for YOUR setups.
     """
+    
     if not ANTHROPIC_API_KEY:
         logger.error("❌ ANTHROPIC_API_KEY not set")
         return None
     
-    logger.info(f"🔮 Analyzing chart for {token_info['symbol']}...")
+    logger.info(f"   🔮 Analyzing for setups...")
     
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         
-        # Convert image to base64
         image_base64 = base64.b64encode(image_bytes).decode('utf-8')
         
         prompt = """You are Jayce, a Wiz Theory trading setup detector.
@@ -222,14 +354,16 @@ Look for:
 
 The 5 setups to detect:
 - 382 + Flip Zone (price at .382 fib retracement)
-- 50 + Flip Zone (price at .50 fib retracement)
+- 50 + Flip Zone (price at .50 fib retracement)  
 - 618 + Flip Zone (price at .618 fib retracement)
 - 786 + Flip Zone (price at .786 fib retracement)
 - Under-Fib Flip Zone (price below .786, deep retracement)
 
-IMPORTANT: Only flag if setup is FORMING (pullback in progress toward a level).
-Do NOT flag if price is just pumping with no pullback.
-Do NOT flag if no clear structure.
+IMPORTANT: 
+- Only flag if setup is FORMING (pullback in progress toward a level)
+- Do NOT flag if price is just pumping with no pullback
+- Do NOT flag if no clear structure
+- Do NOT flag choppy/messy charts
 
 Respond in this exact JSON format:
 {
@@ -269,22 +403,24 @@ Only return the JSON, nothing else."""
             ]
         )
         
-        # Parse response
         result_text = response.content[0].text.strip()
         
-        # Clean up JSON if needed
+        # Clean JSON
         if result_text.startswith('```'):
             result_text = result_text.split('\n', 1)[1]
             result_text = result_text.rsplit('```', 1)[0]
         
-        import json
         result = json.loads(result_text)
         
-        logger.info(f"✅ Analysis complete: setup_detected={result.get('setup_detected')}")
+        if result.get('setup_detected'):
+            logger.info(f"   ✅ Setup detected: {result.get('setup_type')} ({result.get('confidence')}%)")
+        else:
+            logger.info(f"   ⏭️ No setup")
+        
         return result
         
     except Exception as e:
-        logger.error(f"❌ Vision analysis error: {e}")
+        logger.error(f"   ❌ Vision error: {e}")
         return None
 
 
@@ -294,13 +430,14 @@ Only return the JSON, nothing else."""
 
 async def send_alert(token_info: dict, analysis: dict, image_bytes: bytes):
     """
-    Send setup alert to Telegram.
+    Send setup alert to Telegram with emoji-rich format.
     """
+    
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("❌ Telegram credentials not set")
         return
     
-    logger.info(f"📨 Sending alert for {token_info['symbol']}...")
+    logger.info(f"   📨 Sending alert...")
     
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -311,24 +448,18 @@ async def send_alert(token_info: dict, analysis: dict, image_bytes: bytes):
         structure_clean = analysis.get('structure_clean', False)
         timeframe = analysis.get('timeframe_recommendation', '5M')
         
-        # Get trained data for this setup
+        # Get trained data
         trained = TRAINED_SETUPS.get(setup_type, {'count': 0, 'avg_outcome': 0})
         
-        # Format market cap
+        # Format MC
         mc = token_info['market_cap']
-        if mc >= 1_000_000:
-            mc_str = f"{mc/1_000_000:.1f}M"
-        else:
-            mc_str = f"{mc/1_000:.0f}K"
+        mc_str = f"{mc/1_000_000:.1f}M" if mc >= 1_000_000 else f"{mc/1_000:.0f}K"
         
-        # Format liquidity
+        # Format Liq
         liq = token_info['liquidity']
-        if liq >= 1_000_000:
-            liq_str = f"{liq/1_000_000:.1f}M"
-        else:
-            liq_str = f"{liq/1_000:.0f}K"
+        liq_str = f"{liq/1_000_000:.1f}M" if liq >= 1_000_000 else f"{liq/1_000:.0f}K"
         
-        # Build alert message
+        # Alert message (emoji rich!)
         message = f"""🔮 SETUP FORMING 🔥
 
 🪙 ${token_info['symbol']} · 💰 {mc_str} MC · 💧 {liq_str} Liq
@@ -340,7 +471,7 @@ async def send_alert(token_info: dict, analysis: dict, image_bytes: bytes):
 📈 Your avg: +{trained['avg_outcome']}%
 
 ⚡ Conditions
-{'🏗️ Clean Structure' if structure_clean else '⚠️ Structure Needs Confirmation'}
+{'🏗️ Clean Structure' if structure_clean else '⚠️ Structure Forming'}
 
 📝 {notes}
 
@@ -348,7 +479,7 @@ async def send_alert(token_info: dict, analysis: dict, image_bytes: bytes):
 
 ⏰ {datetime.now().strftime('%I:%M %p')}"""
 
-        # Send photo with caption
+        # Send photo
         from io import BytesIO
         photo = BytesIO(image_bytes)
         photo.name = 'chart.png'
@@ -360,10 +491,10 @@ async def send_alert(token_info: dict, analysis: dict, image_bytes: bytes):
             parse_mode=ParseMode.MARKDOWN
         )
         
-        logger.info(f"✅ Alert sent for {token_info['symbol']}")
+        logger.info(f"   ✅ Alert sent!")
         
     except Exception as e:
-        logger.error(f"❌ Alert error: {e}")
+        logger.error(f"   ❌ Alert error: {e}")
 
 
 # ══════════════════════════════════════════════
@@ -372,67 +503,86 @@ async def send_alert(token_info: dict, analysis: dict, image_bytes: bytes):
 
 async def run_scan():
     """Run a single scan cycle."""
-    logger.info("=" * 50)
-    logger.info(f"🚀 Starting scan at {datetime.now().strftime('%I:%M %p')}")
-    logger.info("=" * 50)
+    
+    logger.info("")
+    logger.info("🚀" + "=" * 58)
+    logger.info(f"🚀 STARTING SCAN at {datetime.now().strftime('%I:%M %p')}")
+    logger.info("🚀" + "=" * 58)
+    logger.info("")
     
     # Step 1: Get top movers
     tokens = await get_top_movers()
     
     if not tokens:
-        logger.warning("⚠️ No tokens found matching filters")
+        logger.warning("⚠️ No tokens found matching your filters")
         return
     
-    logger.info(f"📊 Scanning {len(tokens)} tokens...")
+    logger.info(f"📊 Analyzing {len(tokens)} charts for setups...")
+    logger.info("")
     
     setups_found = 0
     
     # Step 2: Analyze each token
     for i, token in enumerate(tokens):
-        logger.info(f"[{i+1}/{len(tokens)}] Checking {token['symbol']}...")
+        logger.info(f"[{i+1}/{len(tokens)}] {token['symbol']}")
         
         try:
-            # Screenshot the chart
-            image_bytes = await screenshot_chart(token['address'], token['pair_address'])
+            # Screenshot
+            image_bytes = await screenshot_chart(token['pair_address'])
             
             if not image_bytes:
                 continue
             
-            # Analyze with Vision
+            # Analyze
             analysis = await analyze_chart(image_bytes, token)
             
             if not analysis:
                 continue
             
-            # Check if setup detected with enough confidence
+            # Check if setup with enough confidence
             if analysis.get('setup_detected') and analysis.get('confidence', 0) >= MIN_MATCH_PERCENT:
-                logger.info(f"🔥 SETUP FOUND: {token['symbol']} - {analysis.get('setup_type')}")
+                logger.info(f"   🔥 SETUP FOUND!")
                 
-                # Send alert
                 await send_alert(token, analysis, image_bytes)
                 setups_found += 1
             
-            # Small delay between tokens
+            # Small delay
             await asyncio.sleep(1)
             
         except Exception as e:
-            logger.error(f"Error processing {token['symbol']}: {e}")
+            logger.error(f"   ❌ Error: {e}")
             continue
     
-    logger.info(f"✅ Scan complete. Setups found: {setups_found}")
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info(f"✅ SCAN COMPLETE")
+    logger.info(f"   📊 Tokens scanned: {len(tokens)}")
+    logger.info(f"   🔥 Setups found: {setups_found}")
+    logger.info("=" * 60)
 
 
 async def main():
     """Main loop - runs scans every X minutes."""
-    logger.info("🧙‍♂️ Jayce Scanner starting up...")
-    logger.info(f"⏰ Scan interval: {SCAN_INTERVAL_MINUTES} minutes")
+    
+    logger.info("")
+    logger.info("🧙‍♂️ JAYCE SCANNER STARTING UP")
+    logger.info("=" * 60)
+    logger.info(f"⏰ Scan interval: Every {SCAN_INTERVAL_MINUTES} minutes")
     logger.info(f"📊 Charts per scan: {CHARTS_PER_SCAN}")
     logger.info(f"🎯 Min match percent: {MIN_MATCH_PERCENT}%")
+    logger.info(f"💰 Min market cap: ${MIN_MARKET_CAP:,} (100K+)")
+    logger.info(f"💧 Min liquidity: ${MIN_LIQUIDITY:,} (10K+)")
+    logger.info(f"⛓️ Chain: Solana only")
+    logger.info(f"🏪 DEX: Pump.fun, Pumpswap, Raydium only")
+    logger.info("=" * 60)
+    logger.info("")
     
-    # Install playwright browsers on first run
-    logger.info("📦 Checking Playwright browsers...")
+    # Install playwright browsers
+    logger.info("📦 Installing Playwright browsers...")
     import subprocess
     subprocess.run(['playwright', 'install', 'chromium'], check=True)
+    logger.info("✅ Browsers ready")
+    logger.info("")
     
     while True:
         try:
@@ -441,6 +591,7 @@ async def main():
             logger.error(f"❌ Scan error: {e}")
         
         logger.info(f"💤 Sleeping for {SCAN_INTERVAL_MINUTES} minutes...")
+        logger.info("")
         await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
 
 
