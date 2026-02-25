@@ -7,21 +7,21 @@ import json
 import sqlite3
 import httpx
 from datetime import datetime, timedelta
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from playwright.async_api import async_playwright
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JAYCE SCANNER v3.1 — BUDGET-SAFE PRE-FILTER FIX
+# JAYCE SCANNER v3.2 — CLEAN ALERTS UPDATE
 # ══════════════════════════════════════════════════════════════════════════════
 # 
-# FIX: Top Movers now pre-filters BEFORE Vision (was missing!)
-# 
-# Vision ONLY runs when:
-# PRIMARY: Impulse + Cooling (pullback forming)
-# SECONDARY: Fresh runner (h1 >= +25%) marked as "forming"
+# CHANGES FROM v3.1:
+# 1. Removed "Trigger: PRIMARY/SECONDARY" line from alerts
+# 2. DexScreener link is now a clickable BUTTON under the alert
+# 3. TZ=America/New_York (set in env)
+# 4. All other logic/filters/settings UNCHANGED
 #
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -998,11 +998,11 @@ Only return the JSON."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM ALERTS
+# TELEGRAM ALERTS — v3.2 CLEAN FORMAT
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
-    """Send setup alert to Telegram."""
+    """Send setup alert to Telegram with DexScreener button."""
     
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("❌ Telegram credentials not set")
@@ -1032,8 +1032,7 @@ async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
         mc_str = f"${mc/1000000:.1f}M" if mc >= 1000000 else f"${mc/1000:.0f}K"
         liq_str = f"${liq/1000000:.1f}M" if liq >= 1000000 else f"${liq/1000:.0f}K"
         
-        trigger_type = token.get('trigger_type', 'SCAN')
-        
+        # v3.2: Removed trigger line, DexScreener is now a button below
         message = f"""🔥 <b>JAYCE ALERT</b> 🔥
 
 <b>{token.get('symbol', '???')}</b> - {token.get('name', 'Unknown')}
@@ -1042,7 +1041,6 @@ async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
 🎯 <b>Stage:</b> {stage}
 💯 <b>Confidence:</b> {confidence}%
 📐 <b>Fib Level:</b> {fib_level}
-🔍 <b>Trigger:</b> {trigger_type}
 
 💰 <b>MC:</b> {mc_str}
 💧 <b>Liq:</b> {liq_str}
@@ -1053,15 +1051,20 @@ async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
 
 💡 <b>Analysis:</b> {reasoning}
 
-🔗 <a href="{token.get('url', '')}">View on Dexscreener</a>
-
 ⏰ {datetime.now().strftime('%I:%M %p')}"""
+
+        # v3.2: DexScreener as a clickable inline button
+        dex_url = token.get('url', f"https://dexscreener.com/solana/{token.get('pair_address', '')}")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 View on DexScreener", url=dex_url)]
+        ])
 
         await bot.send_photo(
             chat_id=TELEGRAM_CHAT_ID,
             photo=BytesIO(annotated),
             caption=message,
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard
         )
         
         record_alert_sent(token.get('address', ''), setup_type)
@@ -1251,13 +1254,14 @@ async def send_test_alert():
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
         
-        message = f"""🧪 <b>JAYCE SCANNER v3.1 TEST</b> 🧪
+        message = f"""🧪 <b>JAYCE SCANNER v3.2 TEST</b> 🧪
 
-✅ Scanner running with BUDGET-SAFE pre-filtering!
+✅ Scanner running with CLEAN ALERTS!
 
-🎯 Vision only runs on:
-• PRIMARY: Impulse + Pullback (setup forming)
-• SECONDARY: Fresh runners (+25% h1)
+🆕 v3.2 Changes:
+• Removed trigger line from alerts
+• DexScreener is now a clickable button
+• Timezone: Eastern (TZ=America/New_York)
 
 ⚙️ Settings:
 • Impulse: +{IMPULSE_H24_THRESHOLD}% (24h) / +{IMPULSE_H6_THRESHOLD}% (6h) / +{IMPULSE_H1_THRESHOLD}% (1h)
@@ -1267,7 +1271,7 @@ async def send_test_alert():
 
 ⏰ {datetime.now().strftime('%I:%M %p')}
 
-✅ Pre-filter fix deployed!"""
+✅ v3.2 deployed!"""
 
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
@@ -1290,7 +1294,7 @@ async def main():
     
     logger.info("")
     logger.info("🧙‍♂️" + "=" * 58)
-    logger.info("🧙‍♂️ JAYCE SCANNER v3.1 — BUDGET-SAFE PRE-FILTER")
+    logger.info("🧙‍♂️ JAYCE SCANNER v3.2 — CLEAN ALERTS")
     logger.info("🧙‍♂️" + "=" * 58)
     logger.info("")
     logger.info("⚙️ YOUR SETTINGS:")
