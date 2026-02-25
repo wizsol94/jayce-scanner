@@ -13,6 +13,11 @@ from playwright.async_api import async_playwright
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 import math
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import mplfinance as mpf
+import pandas as pd
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JAYCE SCANNER v3.3.2 — SCORING + 5M + TIERED ALERTS + TELEGRAM COMMANDS
@@ -859,11 +864,6 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes
         return None
 
     try:
-        import mplfinance as mpf
-        import pandas as pd
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
 
         # Fetch OHLCV data from GeckoTerminal API (5m candles)
         api_url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pair_address}/ohlcv/minute?aggregate=5&limit=100"
