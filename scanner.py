@@ -15,7 +15,7 @@ from io import BytesIO
 import math
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JAYCE SCANNER v3.3.1 — SCORING + 5M + TIERED ALERTS + VISION COOLDOWN
+# JAYCE SCANNER v3.3.2 — SCORING + 5M + TIERED ALERTS + TELEGRAM COMMANDS
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # v3.3.1 CHANGES:
@@ -63,6 +63,10 @@ WATCHLIST_INTERVAL = int(os.getenv('WATCHLIST_INTERVAL', 15))
 
 # Kill switch
 ALERTS_ENABLED = os.getenv('ALERTS_ENABLED', 'true').lower() == 'true'
+
+# v3.3.2: In-memory pause flag — controlled via Telegram /pause /resume commands
+SCANNER_PAUSED = False
+LAST_TELEGRAM_UPDATE_ID = 0
 
 # ── v3.3: Scoring thresholds replace hard gates ──
 SCORE_FORMING = int(os.getenv('SCORE_FORMING', 40))
@@ -1509,13 +1513,82 @@ async def scan_watchlist(browser):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# v3.3.2: TELEGRAM COMMAND LISTENER — /pause, /resume, /status from chat
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def check_telegram_commands():
+    """Background task that polls Telegram for /pause, /resume, /status commands."""
+    global SCANNER_PAUSED, LAST_TELEGRAM_UPDATE_ID
+
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    logger.info("🎮 Telegram command listener started (/pause /resume /status)")
+
+    while True:
+        try:
+            updates = await bot.get_updates(offset=LAST_TELEGRAM_UPDATE_ID + 1, timeout=10)
+            for update in updates:
+                LAST_TELEGRAM_UPDATE_ID = update.update_id
+
+                if not update.message or not update.message.text:
+                    continue
+
+                # Only respond to messages from your chat
+                if str(update.message.chat_id) != str(TELEGRAM_CHAT_ID):
+                    continue
+
+                text = update.message.text.strip().lower()
+
+                if text == '/pause':
+                    SCANNER_PAUSED = True
+                    logger.info("⏸️ Scanner PAUSED via /pause command")
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text="⏸️ <b>Scanner Paused</b>\n\nScanning stopped. Send /resume to restart.",
+                        parse_mode=ParseMode.HTML
+                    )
+
+                elif text == '/resume':
+                    SCANNER_PAUSED = False
+                    logger.info("▶️ Scanner RESUMED via /resume command")
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text="▶️ <b>Scanner Resumed</b>\n\nScanning restarted.",
+                        parse_mode=ParseMode.HTML
+                    )
+
+                elif text == '/status':
+                    m = DAILY_METRICS
+                    total_alerts = m['forming_alerts'] + m['valid_alerts'] + m['confirmed_alerts']
+                    vision_used = get_vision_usage_today()
+                    paused_str = "⏸️ PAUSED" if SCANNER_PAUSED else "🟢 ACTIVE"
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=f"📊 <b>Jayce Scanner Status</b>\n\n"
+                             f"Status: {paused_str}\n"
+                             f"Vision: {vision_used}/{DAILY_VISION_CAP} today\n"
+                             f"Scanned: {m['coins_scanned']} coins\n"
+                             f"Alerts: {total_alerts} (F:{m['forming_alerts']} V:{m['valid_alerts']} C:{m['confirmed_alerts']})\n"
+                             f"Blocked: {m['blocked_no_impulse'] + m['blocked_choppy'] + m['blocked_low_score']}",
+                        parse_mode=ParseMode.HTML
+                    )
+
+        except Exception as e:
+            # Silently retry — don't spam logs for polling errors
+            if "Conflict" not in str(e):
+                logger.debug(f"Command listener error: {e}")
+            await asyncio.sleep(5)
+
+        await asyncio.sleep(2)  # Poll every 2 seconds
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def main():
     """Main scanner loop with scoring system."""
     logger.info("═" * 60)
-    logger.info("🤖 JAYCE SCANNER v3.3.1 — SCORING + 5M + TIERED ALERTS + VISION COOLDOWN")
+    logger.info("🤖 JAYCE SCANNER v3.3.2 — SCORING + 5M + COMMANDS")
     logger.info(f"   Kill switch: {'🟢 ON' if ALERTS_ENABLED else '🔴 OFF'}")
     logger.info(f"   Timeframe: {CHART_TIMEFRAME}")
     logger.info(f"   Scoring: FORMING={SCORE_FORMING} VALID={SCORE_VALID} CONFIRMED={SCORE_CONFIRMED}")
@@ -1548,20 +1621,21 @@ async def main():
         for setup_name, stats in TRAINED_SETUPS.items():
             logger.info(f"   {setup_name}: {stats['count']} charts, avg +{stats['avg_outcome']}%")
 
-    # Send startup message
+    # Send startup message (ONE time only)
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
         status = "🟢 ACTIVE" if ALERTS_ENABLED else "🔴 PAUSED"
         training_status = f"✅ {len(TRAINING_DATA)} charts" if TRAINING_DATA else "⚠️ No training data"
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🤖 <b>Jayce Scanner v3.3.1 Online</b>\n\n"
+            text=f"🤖 <b>Jayce Scanner v3.3.2 Online</b>\n\n"
                  f"Status: {status}\n"
                  f"Timeframe: {CHART_TIMEFRAME}\n"
                  f"Pattern Match: {training_status}\n"
                  f"Scoring: F={SCORE_FORMING} V={SCORE_VALID} C={SCORE_CONFIRMED}\n"
                  f"Vision Cap: {DAILY_VISION_CAP}/day\n"
                  f"Cooldown: {VISION_COOLDOWN_MINUTES}min\n\n"
+                 f"<b>Commands:</b> /pause /resume /status\n\n"
                  f"<i>Probability-series alerts · Mark Douglas execution</i>",
             parse_mode=ParseMode.HTML
         )
@@ -1586,10 +1660,20 @@ async def main():
 
         logger.info("🌐 Browser launched — starting scan loop")
 
+        # v3.3.2: Start Telegram command listener in background
+        asyncio.create_task(check_telegram_commands())
+        logger.info("📡 Telegram command listener started (/pause /resume /status)")
+
         scan_count = 0
         while True:
             try:
-                # Re-check kill switch
+                # v3.3.2: Check in-memory pause flag (controlled via /pause /resume)
+                if SCANNER_PAUSED:
+                    logger.info("⏸️ Scanner paused via /pause command — waiting...")
+                    await asyncio.sleep(10)
+                    continue
+
+                # Re-check env kill switch
                 alerts_enabled = os.getenv('ALERTS_ENABLED', 'true').lower() == 'true'
                 if not alerts_enabled:
                     logger.info("⏸️ Scanner paused via ALERTS_ENABLED=false")
