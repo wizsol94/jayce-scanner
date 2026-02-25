@@ -858,7 +858,7 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
 
     try:
         page = await browser.new_page(viewport={'width': 1400, 'height': 900})
-        await page.goto(url, wait_until='networkidle', timeout=45000)
+        await page.goto(url, wait_until='domcontentloaded', timeout=30000)
         await asyncio.sleep(5)
 
         # Close popups/modals
@@ -1598,12 +1598,8 @@ async def check_telegram_commands():
         except Exception as e:
             error_str = str(e)
             if "Conflict" in error_str:
-                # Another polling session or lingering webhook — re-delete and wait
-                try:
-                    await bot.delete_webhook(drop_pending_updates=True)
-                    logger.info("🔗 Re-deleted webhook after 409 Conflict")
-                except: pass
-                await asyncio.sleep(10)
+                # Another session still active — just wait and retry silently
+                await asyncio.sleep(15)
             else:
                 logger.debug(f"Command listener error: {e}")
                 await asyncio.sleep(5)
