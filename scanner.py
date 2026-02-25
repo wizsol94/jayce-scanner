@@ -1621,26 +1621,10 @@ async def main():
         for setup_name, stats in TRAINED_SETUPS.items():
             logger.info(f"   {setup_name}: {stats['count']} charts, avg +{stats['avg_outcome']}%")
 
-    # Send startup message (ONE time only)
-    try:
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        status = "🟢 ACTIVE" if ALERTS_ENABLED else "🔴 PAUSED"
-        training_status = f"✅ {len(TRAINING_DATA)} charts" if TRAINING_DATA else "⚠️ No training data"
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=f"🤖 <b>Jayce Scanner v3.3.2 Online</b>\n\n"
-                 f"Status: {status}\n"
-                 f"Timeframe: {CHART_TIMEFRAME}\n"
-                 f"Pattern Match: {training_status}\n"
-                 f"Scoring: F={SCORE_FORMING} V={SCORE_VALID} C={SCORE_CONFIRMED}\n"
-                 f"Vision Cap: {DAILY_VISION_CAP}/day\n"
-                 f"Cooldown: {VISION_COOLDOWN_MINUTES}min\n\n"
-                 f"<b>Commands:</b> /pause /resume /status\n\n"
-                 f"<i>Probability-series alerts · Mark Douglas execution</i>",
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as e:
-        logger.error(f"❌ Startup message error: {e}")
+    # Startup info — log only, no Telegram message
+    training_status = f"{len(TRAINING_DATA)} charts" if TRAINING_DATA else "No training data"
+    logger.info(f"📋 Config: {CHART_TIMEFRAME} | Pattern: {training_status} | Scoring: F={SCORE_FORMING} V={SCORE_VALID} C={SCORE_CONFIRMED}")
+    logger.info(f"📋 Vision: {DAILY_VISION_CAP}/day | Cooldown: {VISION_COOLDOWN_MINUTES}min | Commands: /pause /resume /status")
 
     if not ALERTS_ENABLED:
         logger.info("⏸️ Scanner is PAUSED (ALERTS_ENABLED=false). Set to true to resume.")
