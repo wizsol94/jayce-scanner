@@ -888,9 +888,9 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
         if not tf_selected:
             logger.warning(f"⚠️ {symbol}: Could not select 5M timeframe, using default")
 
-        # Wait for TradingView chart canvas to render (longer wait, more patience)
+        # Wait for TradingView chart canvas to render
         canvas_loaded = False
-        for attempt in range(35):
+        for attempt in range(20):
             try:
                 # Method 1: TradingView iframe
                 iframe_count = await page.locator('iframe[src*="tradingview"]').count()
@@ -899,29 +899,41 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
                     canvas_count = await frame.locator('canvas').count()
                     if canvas_count >= 2:
                         canvas_loaded = True
+                        logger.info(f"📊 {symbol}: Chart loaded via TradingView iframe ({canvas_count} canvases)")
                         break
 
                 # Method 2: Direct canvases on page
                 canvas_count = await page.locator('canvas').count()
-                if canvas_count >= 3:
+                if canvas_count >= 2:
                     canvas_loaded = True
+                    logger.info(f"📊 {symbol}: Chart loaded via direct canvases ({canvas_count} found)")
                     break
 
                 # Method 3: Chart container with canvases
                 chart = page.locator('.chart-container, .tv-chart-container, [class*="chart"]').first
                 if await chart.is_visible(timeout=500):
                     inner_canvas = await chart.locator('canvas').count()
-                    if inner_canvas >= 2:
+                    if inner_canvas >= 1:
                         canvas_loaded = True
+                        logger.info(f"📊 {symbol}: Chart loaded via container ({inner_canvas} canvases)")
                         break
 
             except: pass
             await asyncio.sleep(1)
 
         if not canvas_loaded:
-            logger.warning(f"⚠️ Chart canvas may not have loaded for {symbol}, taking screenshot anyway")
+            # Debug: log what IS on the page
+            try:
+                canvas_count = await page.locator('canvas').count()
+                iframe_count = await page.locator('iframe').count()
+                svg_count = await page.locator('svg').count()
+                logger.warning(f"⚠️ {symbol}: Canvas not detected. Found: {canvas_count} canvas, {iframe_count} iframe, {svg_count} svg — waiting 10s extra")
+            except:
+                logger.warning(f"⚠️ {symbol}: Canvas detection failed — waiting 10s extra")
+            # Give it extra time — chart may render via different mechanism
+            await asyncio.sleep(10)
 
-        # Extra settle time after canvas detected
+        # Extra settle time for candle data to draw
         await asyncio.sleep(3)
 
         # Try to screenshot just the chart area (multiple selector strategies)
