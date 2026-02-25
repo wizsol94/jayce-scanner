@@ -39,6 +39,9 @@ DAILY_VISION_CAP = int(os.getenv('DAILY_VISION_CAP', 250))
 TOP_MOVERS_INTERVAL = int(os.getenv('TOP_MOVERS_INTERVAL', 5))
 WATCHLIST_INTERVAL = int(os.getenv('WATCHLIST_INTERVAL', 15))
 
+# Kill switch — set ALERTS_ENABLED=false in Railway to pause all alerts
+ALERTS_ENABLED = os.getenv('ALERTS_ENABLED', 'true').lower() == 'true'
+
 TRAINED_SETUPS = {
     '382 + Flip Zone': {'count': 40, 'avg_outcome': 85},
     '50 + Flip Zone': {'count': 45, 'avg_outcome': 92},
@@ -613,6 +616,9 @@ Only return the JSON."""
 
 async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
     """Send setup alert to Telegram with DexScreener button."""
+    if not ALERTS_ENABLED:
+        logger.info(f"   ⏸️ Alerts paused (ALERTS_ENABLED=false) — skipping {token.get('symbol','???')}")
+        return
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("❌ Telegram credentials not set"); return
     setup_type = analysis.get('setup_type', 'Unknown Setup')
@@ -799,6 +805,13 @@ async def main():
     while True:
         try:
             now = datetime.now()
+
+            # FULL PAUSE — nothing runs, no money spent
+            if not ALERTS_ENABLED:
+                logger.info(f"⏸️ Scanner PAUSED (ALERTS_ENABLED=false) — sleeping 60s...")
+                await asyncio.sleep(60)
+                continue
+
             cleanup_old_watchlist()
             if (now - last_movers).total_seconds() >= TOP_MOVERS_INTERVAL * 60:
                 await scan_top_movers(); last_movers = now
