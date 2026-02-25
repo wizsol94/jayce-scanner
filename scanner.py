@@ -963,6 +963,22 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
         # Fallback: crop top portion of page (chart is always at top on DexScreener)
         screenshot = await page.screenshot(type='png', full_page=False, clip={'x': 0, 'y': 0, 'width': 1400, 'height': 650})
         logger.info(f"📸 Cropped screenshot for {symbol} (top 650px, {len(screenshot)} bytes)")
+
+        # DEBUG: Send first screenshot to Telegram so we can see what Vision sees
+        if DAILY_METRICS.get('vision_calls', 0) < 2:
+            try:
+                from telegram import Bot
+                import io
+                debug_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+                await debug_bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=io.BytesIO(screenshot),
+                    caption=f"🔬 DEBUG: What Vision sees for {symbol} (5M)"
+                )
+                logger.info(f"📤 Debug screenshot sent to Telegram for {symbol}")
+            except Exception as de:
+                logger.warning(f"⚠️ Could not send debug screenshot: {de}")
+
         return screenshot
 
     except Exception as e:
@@ -1217,6 +1233,10 @@ async def analyze_chart_vision(image_bytes: bytes, symbol: str) -> dict:
         logger.info(f"🔍 Vision for {symbol}: setup={result.get('is_setup')} "
                     f"type={result.get('setup_type', '-')} conf={result.get('confidence', 0)} "
                     f"structure={result.get('structure_quality', '?')}")
+        # Log Vision's reasoning so we can debug what it sees
+        reasoning = result.get('reasoning', '')
+        if reasoning:
+            logger.info(f"💭 Vision reasoning for {symbol}: {reasoning[:200]}")
         return result
 
     except Exception as e:
