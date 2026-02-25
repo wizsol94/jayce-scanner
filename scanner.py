@@ -941,37 +941,15 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes
                 logger.warning(f"⚠️ {symbol}: Chart detection failed — waiting 8s")
             await asyncio.sleep(8)
 
-        # Extra settle time for candle data to fully draw
-        await asyncio.sleep(3)
+        # Extra settle time for candle data to fully draw (GeckoTerminal needs more time)
+        await asyncio.sleep(8)
 
-        # Try to screenshot just the chart area (multiple selector strategies)
-        chart_selectors = [
-            '#chart-container',           # DexScreener main chart
-            '[class*="ChartContainer"]',  # React component naming
-            '.chart-container',
-            '[class*="chart-"]',          # Any chart-related class
-            'div[class*="chart"] svg',    # SVG inside chart div
-            'div[class*="chart"]',        # Chart div itself
-            '.tv-chart-container',
-            '[class*="tradingview"]',
-            'iframe[src*="tradingview"]',
-        ]
-        for chart_sel in chart_selectors:
-            try:
-                el = page.locator(chart_sel).first
-                if await el.is_visible(timeout=1500):
-                    screenshot = await el.screenshot(type='png')
-                    if len(screenshot) > 5000:
-                        logger.info(f"📸 Chart screenshot captured for {symbol} via '{chart_sel}' ({len(screenshot)} bytes)")
-                        return screenshot
-            except: pass
+        # Take full viewport screenshot (most reliable — chart fills top area on GeckoTerminal)
+        screenshot = await page.screenshot(type='png', full_page=False, clip={'x': 0, 'y': 0, 'width': 1400, 'height': 700})
+        logger.info(f"📸 Screenshot for {symbol} ({len(screenshot)} bytes)")
 
-        # Fallback: crop top portion of page (chart is always at top on DexScreener)
-        screenshot = await page.screenshot(type='png', full_page=False, clip={'x': 0, 'y': 0, 'width': 1400, 'height': 650})
-        logger.info(f"📸 Cropped screenshot for {symbol} (top 650px, {len(screenshot)} bytes)")
-
-        # DEBUG: Send first screenshot to Telegram so we can see what Vision sees
-        if DAILY_METRICS.get('vision_calls', 0) < 2:
+        # DEBUG: Send first 3 screenshots to Telegram
+        if DAILY_METRICS.get('vision_calls', 0) < 3:
             try:
                 from telegram import Bot
                 import io
@@ -979,7 +957,7 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes
                 await debug_bot.send_photo(
                     chat_id=TELEGRAM_CHAT_ID,
                     photo=io.BytesIO(screenshot),
-                    caption=f"🔬 DEBUG: What Vision sees for {symbol} (5M)"
+                    caption=f"🔬 DEBUG: What Vision sees for {symbol} (GeckoTerminal)"
                 )
                 logger.info(f"📤 Debug screenshot sent to Telegram for {symbol}")
             except Exception as de:
