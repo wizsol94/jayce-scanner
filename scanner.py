@@ -15,16 +15,18 @@ from io import BytesIO
 import math
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JAYCE SCANNER v3.2 — PATTERN MATCHING + CLEAN CHARTS + CLEAN ALERTS
+# JAYCE SCANNER v3.3 — SCORING SYSTEM + 5M TIMEFRAME + TIERED ALERTS
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# v3.2 CHANGES:
-# 1. REAL PATTERN MATCHING against 222+ trained charts from GitHub
-# 2. Fixed chart screenshots (waits for TradingView to load)
-# 3. YOUR annotation style (flip zone, breakout, fib, bounce path)
-# 4. Removed trigger line, DexScreener button
-# 5. Kill switch (ALERTS_ENABLED=false pauses everything)
-# 6. Training data pulled from GitHub on startup
+# v3.3 CHANGES:
+# 1. FORCED 5M TIMEFRAME everywhere (screenshots, vision, pattern matching)
+# 2. SCORING SYSTEM replaces hard gates (0.6 vision + 0.4 pattern)
+# 3. THREE ALERT TIERS: FORMING (40+), VALID (55+), CONFIRMED (70+)
+# 4. VOLUME-BASED SCANNING (5m + 1h volume movers, not just boosted)
+# 5. HARD BLOCK conditions (anti-spam)
+# 6. DAILY METRICS LOGGING
+# 7. Budget-safe 2-stage detection preserved
+# 8. NO changes to alert formatting, annotations, DB structure
 #
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -57,14 +59,29 @@ WATCHLIST_INTERVAL = int(os.getenv('WATCHLIST_INTERVAL', 15))
 # Kill switch
 ALERTS_ENABLED = os.getenv('ALERTS_ENABLED', 'true').lower() == 'true'
 
-# Pattern match minimum to send alert (0-100)
+# ── v3.3: Scoring thresholds replace hard gates ──
+SCORE_FORMING = int(os.getenv('SCORE_FORMING', 40))
+SCORE_VALID = int(os.getenv('SCORE_VALID', 55))
+SCORE_CONFIRMED = int(os.getenv('SCORE_CONFIRMED', 70))
+
+# Scoring weights
+VISION_WEIGHT = float(os.getenv('VISION_WEIGHT', 0.6))
+PATTERN_WEIGHT = float(os.getenv('PATTERN_WEIGHT', 0.4))
+
+# ── v3.3: Dedup windows per tier (hours) ──
+DEDUP_FORMING_HOURS = int(os.getenv('DEDUP_FORMING_HOURS', 3))
+DEDUP_VALID_HOURS = int(os.getenv('DEDUP_VALID_HOURS', 9))
+DEDUP_CONFIRMED_HOURS = int(os.getenv('DEDUP_CONFIRMED_HOURS', 24))
+
+# ── v3.3: Forced timeframe ──
+CHART_TIMEFRAME = os.getenv('CHART_TIMEFRAME', '5M')
+
+# Pattern match minimum (kept for fallback but scoring system is primary gate now)
 MIN_PATTERN_SCORE = int(os.getenv('MIN_PATTERN_SCORE', 50))
 
-# GitHub training data config (same repo as jayce-bot)
+# GitHub training data config
 GITHUB_REPO = os.getenv('GITHUB_REPO', 'wizsol94/jayce-bot')
 GITHUB_BACKUP_PATH = os.getenv('GITHUB_BACKUP_PATH', 'backups/jayce_training_dataset.json')
-
-# Training refresh interval (hours)
 TRAINING_REFRESH_HOURS = int(os.getenv('TRAINING_REFRESH_HOURS', 6))
 
 TRAINED_SETUPS = {
@@ -79,10 +96,71 @@ DB_PATH = os.getenv('DB_PATH', '/app/jayce_memory.db')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# v3.3: DAILY METRICS — Track scan performance for tuning
+# ══════════════════════════════════════════════════════════════════════════════
+
+DAILY_METRICS = {
+    'date': None,
+    'coins_scanned': 0,
+    'coins_passed_prefilter': 0,
+    'vision_calls': 0,
+    'forming_alerts': 0,
+    'valid_alerts': 0,
+    'confirmed_alerts': 0,
+    'blocked_no_impulse': 0,
+    'blocked_choppy': 0,
+    'blocked_low_score': 0,
+}
+
+
+def reset_metrics_if_new_day():
+    """Reset daily metrics at midnight."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    if DAILY_METRICS['date'] != today:
+        if DAILY_METRICS['date'] is not None:
+            log_daily_summary()
+        DAILY_METRICS['date'] = today
+        for key in DAILY_METRICS:
+            if key != 'date':
+                DAILY_METRICS[key] = 0
+
+
+def log_daily_summary():
+    """Log end-of-day metrics summary."""
+    m = DAILY_METRICS
+    total_alerts = m['forming_alerts'] + m['valid_alerts'] + m['confirmed_alerts']
+    logger.info("═" * 60)
+    logger.info("📊 DAILY METRICS SUMMARY")
+    logger.info(f"   Date: {m['date']}")
+    logger.info(f"   Coins scanned: {m['coins_scanned']}")
+    logger.info(f"   Passed pre-filter: {m['coins_passed_prefilter']}")
+    logger.info(f"   Vision calls used: {m['vision_calls']}")
+    logger.info(f"   ─── Alerts ───")
+    logger.info(f"   FORMING: {m['forming_alerts']}")
+    logger.info(f"   VALID:   {m['valid_alerts']}")
+    logger.info(f"   CONFIRMED: {m['confirmed_alerts']}")
+    logger.info(f"   TOTAL:   {total_alerts}")
+    logger.info(f"   ─── Blocked ───")
+    logger.info(f"   No impulse: {m['blocked_no_impulse']}")
+    logger.info(f"   Choppy/invalid: {m['blocked_choppy']}")
+    logger.info(f"   Low score: {m['blocked_low_score']}")
+    logger.info("═" * 60)
+
+
+def log_current_metrics():
+    """Log current metrics mid-day."""
+    m = DAILY_METRICS
+    total_alerts = m['forming_alerts'] + m['valid_alerts'] + m['confirmed_alerts']
+    logger.info(f"📊 Metrics so far — Scanned: {m['coins_scanned']} | "
+                f"Pre-filter: {m['coins_passed_prefilter']} | "
+                f"Vision: {m['vision_calls']} | "
+                f"Alerts: {total_alerts} (F:{m['forming_alerts']} V:{m['valid_alerts']} C:{m['confirmed_alerts']})")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TRAINING DATA SYSTEM — Pulls from GitHub, matches against real charts
 # ══════════════════════════════════════════════════════════════════════════════
 
-# In-memory training data (loaded from GitHub on startup)
 TRAINING_DATA = []
 TRAINING_LAST_LOADED = None
 
@@ -113,7 +191,6 @@ async def load_training_from_github() -> list:
                 TRAINING_LAST_LOADED = datetime.now()
                 logger.info(f"✅ Loaded {len(data)} training charts from GitHub")
 
-                # Update TRAINED_SETUPS counts from real data
                 for setup_name in TRAINED_SETUPS:
                     count = len([t for t in data if t.get('setup_name') == setup_name])
                     outcomes = [t.get('outcome_percentage', 0) for t in data
@@ -155,7 +232,7 @@ async def ensure_training_data():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PATTERN MATCHING ENGINE — Same logic as bot.py, adapted for scanner
+# PATTERN MATCHING ENGINE — Uses forced 5M timeframe
 # ══════════════════════════════════════════════════════════════════════════════
 
 CONDITION_KEYWORDS = {
@@ -170,20 +247,22 @@ CONDITION_KEYWORDS = {
 def get_pattern_matches(setup_name: str, timeframe: str = None, token: str = None) -> dict:
     """
     Find matching patterns from training data for a given setup.
-    This is the REAL pattern matching against your 222+ trained charts.
+    v3.3: timeframe defaults to CHART_TIMEFRAME (5M).
     """
+    # v3.3: Force 5M timeframe
+    if timeframe is None:
+        timeframe = CHART_TIMEFRAME
+
     if not TRAINING_DATA:
         return {'total_matches': 0, 'total_trained': 0, 'match_percentage': 0,
                 'avg_outcome': 0, 'best_match': None, 'best_match_score': 0, 'matches': []}
 
-    # Filter by setup type
     setup_charts = [t for t in TRAINING_DATA if t.get('setup_name') == setup_name]
 
     if not setup_charts:
         return {'total_matches': 0, 'total_trained': len(TRAINING_DATA), 'match_percentage': 0,
                 'avg_outcome': 0, 'best_match': None, 'best_match_score': 0, 'matches': []}
 
-    # Score each trained chart
     matches = []
     for chart in setup_charts:
         score = 0.40  # Base score for setup type match
@@ -254,7 +333,34 @@ def build_pattern_match_text(pattern_data: dict) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATABASE
+# v3.3: SCORING SYSTEM — Replaces hard gates
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calculate_setup_score(vision_confidence: float, pattern_match_score: float) -> float:
+    """
+    Combined setup score: 0.6 * Vision + 0.4 * Pattern.
+    Both inputs should be 0–100.
+    """
+    return (VISION_WEIGHT * vision_confidence) + (PATTERN_WEIGHT * pattern_match_score)
+
+
+def get_alert_tier(score: float) -> tuple:
+    """
+    Determine alert tier from combined score.
+    Returns (tier_name, tier_emoji, dedup_hours).
+    """
+    if score >= SCORE_CONFIRMED:
+        return ('CONFIRMED', '🟢', DEDUP_CONFIRMED_HOURS)
+    elif score >= SCORE_VALID:
+        return ('VALID', '🟡', DEDUP_VALID_HOURS)
+    elif score >= SCORE_FORMING:
+        return ('FORMING', '🔵', DEDUP_FORMING_HOURS)
+    else:
+        return (None, None, None)  # Below threshold — no alert
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE — Unchanged structure, updated dedup logic
 # ══════════════════════════════════════════════════════════════════════════════
 
 def init_database():
@@ -325,9 +431,13 @@ def cleanup_old_watchlist():
     d = c.rowcount; conn.commit(); conn.close()
     if d > 0: logger.info(f"🧹 Cleaned {d} old tokens from watchlist")
 
-def was_alert_sent(token_address: str, setup_type: str) -> bool:
+
+# ── v3.3: Tiered dedup — uses dedup_hours based on alert tier ──
+
+def was_alert_sent(token_address: str, setup_type: str, dedup_hours: int = 24) -> bool:
+    """Check if alert was already sent within the dedup window."""
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+    cutoff = (datetime.now() - timedelta(hours=dedup_hours)).isoformat()
     c.execute('SELECT 1 FROM alerts_sent WHERE token_address=? AND setup_type=? AND sent_at>?',
               (token_address, setup_type, cutoff))
     result = c.fetchone(); conn.close(); return result is not None
@@ -352,81 +462,240 @@ def increment_vision_usage():
 def can_use_vision() -> bool:
     return get_vision_usage_today() < DAILY_VISION_CAP
 
-def should_use_vision(token: dict) -> tuple:
-    h1 = token.get('price_change_1h', 0); h6 = token.get('price_change_6h', 0); h24 = token.get('price_change_24h', 0)
-    had_impulse = (h24 >= IMPULSE_H24_THRESHOLD or h6 >= IMPULSE_H6_THRESHOLD or h1 >= IMPULSE_H1_THRESHOLD)
-    is_cooling = POST_IMPULSE_H1_MIN <= h1 <= POST_IMPULSE_H1_MAX
-    if had_impulse and is_cooling: return (True, 'PRIMARY', 'testing')
-    if h1 >= FRESH_RUNNER_H1_THRESHOLD: return (True, 'SECONDARY', 'forming')
-    return (False, None, None)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE A: CHEAP PRE-FILTER — No Vision, no cost
+# ══════════════════════════════════════════════════════════════════════════════
 
 def detect_impulse(token: dict) -> bool:
-    return (token.get('price_change_24h',0) >= IMPULSE_H24_THRESHOLD or
-            token.get('price_change_6h',0) >= IMPULSE_H6_THRESHOLD or
-            token.get('price_change_1h',0) >= IMPULSE_H1_THRESHOLD)
+    """Check if token had a qualifying impulse move."""
+    return (token.get('price_change_24h', 0) >= IMPULSE_H24_THRESHOLD or
+            token.get('price_change_6h', 0) >= IMPULSE_H6_THRESHOLD or
+            token.get('price_change_1h', 0) >= IMPULSE_H1_THRESHOLD)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PRE-FILTER — Quick checks before spending Vision credits
-# ══════════════════════════════════════════════════════════════════════════════
+def detect_fresh_runner(token: dict) -> bool:
+    """Check if token is a fresh runner (h1 >= threshold)."""
+    return token.get('price_change_1h', 0) >= FRESH_RUNNER_H1_THRESHOLD
+
+
+def should_use_vision(token: dict) -> tuple:
+    """
+    Stage A gate: determine if this token warrants a Vision call.
+    v3.3: Budget-safe — Vision ONLY for impulse + cooling OR fresh runners.
+    Returns (should_vision, trigger_type, stage_label).
+    """
+    h1 = token.get('price_change_1h', 0)
+    h6 = token.get('price_change_6h', 0)
+    h24 = token.get('price_change_24h', 0)
+
+    had_impulse = (h24 >= IMPULSE_H24_THRESHOLD or
+                   h6 >= IMPULSE_H6_THRESHOLD or
+                   h1 >= IMPULSE_H1_THRESHOLD)
+
+    is_cooling = POST_IMPULSE_H1_MIN <= h1 <= POST_IMPULSE_H1_MAX
+
+    # Primary: impulse detected AND now cooling/pulling back (setup forming)
+    if had_impulse and is_cooling:
+        return (True, 'PRIMARY', 'testing')
+
+    # Secondary: fresh runner still running (early forming)
+    if h1 >= FRESH_RUNNER_H1_THRESHOLD:
+        return (True, 'SECONDARY', 'forming')
+
+    return (False, None, None)
+
 
 def pre_filter_token(token: dict) -> tuple:
-    """Pre-filter checks. Returns (passed, reason)."""
+    """
+    Stage A pre-filter checks. Returns (passed, reason).
+    v3.3: No dedup check here — dedup is now tier-aware and happens later.
+    """
     mc = token.get('market_cap', 0)
     liq = token.get('liquidity', 0)
-    symbol = token.get('symbol', '???')
 
     if mc < MIN_MARKET_CAP:
         return (False, f"Market cap too low: ${mc:,.0f}")
     if liq < MIN_LIQUIDITY:
         return (False, f"Liquidity too low: ${liq:,.0f}")
-    if was_alert_sent(token.get('address', ''), 'ANY'):
-        return (False, "Alert already sent in last 24h")
     return (True, "Passed pre-filter")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DEXSCREENER API — Fetch top movers from Solana
+# v3.3: HARD BLOCK CONDITIONS — Anti-spam layer
+# ══════════════════════════════════════════════════════════════════════════════
+
+CHOPPY_KEYWORDS = ['choppy', 'no structure', 'no setup', 'messy', 'sideways', 'range-bound',
+                   'no clear', 'unclear', 'weak structure', 'no impulse visible']
+
+
+def hard_block_check(token: dict, vision_result: dict) -> tuple:
+    """
+    v3.3: Hard block conditions that override scoring.
+    Returns (blocked, reason).
+    """
+    # Block 1: No impulse memory AND not a fresh runner
+    if not detect_impulse(token) and not detect_fresh_runner(token):
+        return (True, "No impulse memory and not a fresh runner")
+
+    # Block 2: Vision explicitly flags structure as choppy/invalid
+    if vision_result:
+        reasoning = vision_result.get('reasoning', '').lower()
+        for keyword in CHOPPY_KEYWORDS:
+            if keyword in reasoning:
+                return (True, f"Vision flagged as choppy/invalid: '{keyword}'")
+
+        # Block if Vision says is_setup=False with low confidence
+        if not vision_result.get('is_setup', False) and vision_result.get('confidence', 0) < 30:
+            return (True, "Vision rejected setup with very low confidence")
+
+    # Block 3: Liquidity or market cap fails (redundant safety net)
+    if token.get('market_cap', 0) < MIN_MARKET_CAP:
+        return (True, f"Market cap below minimum: ${token.get('market_cap', 0):,.0f}")
+    if token.get('liquidity', 0) < MIN_LIQUIDITY:
+        return (True, f"Liquidity below minimum: ${token.get('liquidity', 0):,.0f}")
+
+    return (False, "Passed hard block checks")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEXSCREENER API — v3.3: Added volume-based scanning
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def fetch_top_movers() -> list:
-    """Fetch top movers from DexScreener boosted/trending."""
+    """
+    Fetch top movers from DexScreener.
+    v3.3: Includes boosted/trending + volume-based pairs (5m and 1h volume).
+    Goal: catch coins that ALREADY moved and are now forming pullback setups.
+    """
     tokens = []
+    seen = set()
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            # Try boosted tokens first
-            resp = await client.get('https://api.dexscreener.com/token-boosts/top/v1')
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data if isinstance(data, list) else data.get('tokens', data.get('pairs', []))
-                seen = set()
-                for item in items[:CHARTS_PER_SCAN]:
-                    addr = item.get('tokenAddress', item.get('baseToken', {}).get('address', ''))
-                    if not addr or addr in seen: continue
-                    if item.get('chainId', 'solana') != 'solana': continue
-                    seen.add(addr)
-                    tokens.append({'address': addr, 'symbol': item.get('symbol', item.get('baseToken', {}).get('symbol', '???')),
-                                   'name': item.get('name', item.get('baseToken', {}).get('name', 'Unknown')),
-                                   'pair_address': item.get('pairAddress', ''), 'source': 'BOOSTED'})
 
-            # Also try gainers
-            resp2 = await client.get('https://api.dexscreener.com/token-profiles/latest/v1')
-            if resp2.status_code == 200:
-                data2 = resp2.json()
-                items2 = data2 if isinstance(data2, list) else data2.get('tokens', [])
-                seen2 = set(t['address'] for t in tokens)
-                for item in items2[:30]:
-                    addr = item.get('tokenAddress', '')
-                    if not addr or addr in seen2: continue
-                    if item.get('chainId', 'solana') != 'solana': continue
-                    seen2.add(addr)
-                    tokens.append({'address': addr, 'symbol': item.get('symbol', '???'),
-                                   'name': item.get('name', 'Unknown'), 'pair_address': '', 'source': 'PROFILES'})
+            # ── Source 1: Boosted tokens (existing) ──
+            try:
+                resp = await client.get('https://api.dexscreener.com/token-boosts/top/v1')
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data if isinstance(data, list) else data.get('tokens', data.get('pairs', []))
+                    for item in items[:CHARTS_PER_SCAN]:
+                        addr = item.get('tokenAddress', item.get('baseToken', {}).get('address', ''))
+                        if not addr or addr in seen: continue
+                        if item.get('chainId', 'solana') != 'solana': continue
+                        seen.add(addr)
+                        tokens.append({'address': addr,
+                                       'symbol': item.get('symbol', item.get('baseToken', {}).get('symbol', '???')),
+                                       'name': item.get('name', item.get('baseToken', {}).get('name', 'Unknown')),
+                                       'pair_address': item.get('pairAddress', ''), 'source': 'BOOSTED'})
+                    logger.info(f"   Boosted: {len(tokens)} tokens")
+            except Exception as e:
+                logger.error(f"❌ Boosted fetch error: {e}")
+
+            # ── Source 2: Latest profiles (existing) ──
+            try:
+                resp2 = await client.get('https://api.dexscreener.com/token-profiles/latest/v1')
+                if resp2.status_code == 200:
+                    data2 = resp2.json()
+                    items2 = data2 if isinstance(data2, list) else data2.get('tokens', [])
+                    count_before = len(tokens)
+                    for item in items2[:30]:
+                        addr = item.get('tokenAddress', '')
+                        if not addr or addr in seen: continue
+                        if item.get('chainId', 'solana') != 'solana': continue
+                        seen.add(addr)
+                        tokens.append({'address': addr, 'symbol': item.get('symbol', '???'),
+                                       'name': item.get('name', 'Unknown'), 'pair_address': '', 'source': 'PROFILES'})
+                    logger.info(f"   Profiles: {len(tokens) - count_before} new tokens")
+            except Exception as e:
+                logger.error(f"❌ Profiles fetch error: {e}")
+
+            # ── Source 3: v3.3 — Top pairs by volume (catches actual movers) ──
+            # DexScreener search with sort by volume on Solana
+            for search_query in ['sol', 'solana']:
+                try:
+                    resp3 = await client.get(
+                        f'https://api.dexscreener.com/latest/dex/search?q={search_query}',
+                        params={'sort': 'volume', 'order': 'desc'}
+                    )
+                    if resp3.status_code == 200:
+                        data3 = resp3.json()
+                        pairs = data3.get('pairs', [])
+                        count_before = len(tokens)
+                        for pair in pairs[:40]:
+                            if pair.get('chainId', '') != 'solana': continue
+                            addr = pair.get('baseToken', {}).get('address', '')
+                            if not addr or addr in seen: continue
+
+                            # v3.3: Filter for volume activity (5m and 1h context)
+                            vol_h24 = float(pair.get('volume', {}).get('h24', 0) or 0)
+                            pc_h1 = float(pair.get('priceChange', {}).get('h1', 0) or 0)
+                            mc = float(pair.get('marketCap', 0) or pair.get('fdv', 0) or 0)
+
+                            # Skip dead pairs
+                            if vol_h24 < 50000 or mc < MIN_MARKET_CAP:
+                                continue
+
+                            seen.add(addr)
+                            tokens.append({
+                                'address': addr,
+                                'pair_address': pair.get('pairAddress', ''),
+                                'symbol': pair.get('baseToken', {}).get('symbol', '???'),
+                                'name': pair.get('baseToken', {}).get('name', 'Unknown'),
+                                'source': 'VOLUME',
+                                # Pre-populate data so we might skip the fetch_token_data call
+                                'price_usd': float(pair.get('priceUsd', 0) or 0),
+                                'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
+                                'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
+                                'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
+                                'market_cap': mc,
+                                'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
+                                'volume_24h': vol_h24,
+                            })
+                        logger.info(f"   Volume ({search_query}): {len(tokens) - count_before} new tokens")
+                except Exception as e:
+                    logger.error(f"❌ Volume search error ({search_query}): {e}")
+
+            # ── Source 4: v3.3 — Solana gainers (1h movers pulling back) ──
+            try:
+                resp4 = await client.get('https://api.dexscreener.com/latest/dex/pairs/solana')
+                if resp4.status_code == 200:
+                    data4 = resp4.json()
+                    pairs4 = data4.get('pairs', [])
+                    # Sort by h1 price change descending to find recent movers
+                    pairs4_sorted = sorted(pairs4,
+                                           key=lambda p: abs(float(p.get('priceChange', {}).get('h1', 0) or 0)),
+                                           reverse=True)
+                    count_before = len(tokens)
+                    for pair in pairs4_sorted[:30]:
+                        addr = pair.get('baseToken', {}).get('address', '')
+                        if not addr or addr in seen: continue
+                        mc = float(pair.get('marketCap', 0) or pair.get('fdv', 0) or 0)
+                        if mc < MIN_MARKET_CAP: continue
+                        seen.add(addr)
+                        tokens.append({
+                            'address': addr,
+                            'pair_address': pair.get('pairAddress', ''),
+                            'symbol': pair.get('baseToken', {}).get('symbol', '???'),
+                            'name': pair.get('baseToken', {}).get('name', 'Unknown'),
+                            'source': 'GAINERS',
+                            'price_usd': float(pair.get('priceUsd', 0) or 0),
+                            'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
+                            'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
+                            'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
+                            'market_cap': mc,
+                            'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
+                            'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
+                        })
+                    logger.info(f"   Gainers: {len(tokens) - count_before} new tokens")
+            except Exception as e:
+                logger.error(f"❌ Gainers fetch error: {e}")
 
     except Exception as e:
         logger.error(f"❌ DexScreener API error: {e}")
 
-    logger.info(f"📊 Fetched {len(tokens)} tokens from DexScreener")
+    logger.info(f"📊 Total fetched: {len(tokens)} tokens from all sources")
     return tokens
 
 
@@ -462,11 +731,11 @@ async def fetch_token_data(token_address: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHART SCREENSHOT — Captures TradingView chart from DexScreener
+# CHART SCREENSHOT — v3.3: Forces 5M timeframe
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
-    """Capture TradingView chart from DexScreener with proper wait for canvas."""
+    """Capture TradingView chart from DexScreener. v3.3: Forces 5M timeframe."""
     if not pair_address:
         logger.warning(f"⚠️ No pair address for {symbol}")
         return None
@@ -489,21 +758,27 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
                     await asyncio.sleep(0.5)
             except: pass
 
-        # Try to select 15m timeframe
-        for tf_sel in ['button:has-text("15m")', '[data-timeframe="15"]', 'button:has-text("15")']:
+        # ── v3.3: Force 5M timeframe (was 15m) ──
+        tf_selected = False
+        for tf_sel in ['button:has-text("5m")', 'button:has-text("5M")',
+                       '[data-timeframe="5"]', 'button:has-text("5")']:
             try:
                 btn = page.locator(tf_sel).first
                 if await btn.is_visible(timeout=2000):
                     await btn.click()
                     await asyncio.sleep(2)
+                    tf_selected = True
+                    logger.info(f"📐 {symbol}: 5M timeframe selected")
                     break
             except: pass
+
+        if not tf_selected:
+            logger.warning(f"⚠️ {symbol}: Could not select 5M timeframe, using default")
 
         # Wait for TradingView chart canvas to render
         canvas_loaded = False
         for attempt in range(25):
             try:
-                # Check for iframe-based TradingView
                 iframe_count = await page.locator('iframe[src*="tradingview"]').count()
                 if iframe_count > 0:
                     frame = page.frame_locator('iframe[src*="tradingview"]')
@@ -512,13 +787,11 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
                         canvas_loaded = True
                         break
 
-                # Check for direct canvas elements
                 canvas_count = await page.locator('canvas').count()
                 if canvas_count >= 3:
                     canvas_loaded = True
                     break
 
-                # Check for chart container
                 chart = page.locator('.chart-container, .tv-chart-container, [class*="chart"]').first
                 if await chart.is_visible(timeout=500):
                     inner_canvas = await chart.locator('canvas').count()
@@ -560,7 +833,7 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHART ANNOTATION — Your style: fib lines, flip zone, bounce path
+# CHART ANNOTATION — Unchanged from v3.2
 # ══════════════════════════════════════════════════════════════════════════════
 
 FIB_COLORS = {
@@ -605,7 +878,6 @@ def annotate_chart(image_bytes: bytes, vision_data: dict) -> bytes:
         for level_str, y_pct in fib_levels.items():
             y = int(H * y_pct / 100)
             color = FIB_COLORS.get(level_str, (200, 200, 200))
-            # Draw dashed line
             dash_len = 15
             gap_len = 8
             x = 0
@@ -620,7 +892,6 @@ def annotate_chart(image_bytes: bytes, vision_data: dict) -> bytes:
             y1, y2 = int(H * fz_top / 100), int(H * fz_bot / 100)
             draw.rectangle([0, y1, W, y2], fill=(128, 0, 255, 50))
             draw.rectangle([0, y1, W, y2], outline=(128, 0, 255, 180), width=2)
-            # FLIP ZONE text centered
             try:
                 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
             except:
@@ -641,7 +912,6 @@ def annotate_chart(image_bytes: bytes, vision_data: dict) -> bytes:
             except:
                 font_b = ImageFont.load_default()
             draw.text((px, py - 25), "BREAKOUT", fill=(255, 255, 255, 230), font=font_b)
-            # Arrow pointing down to breakout
             draw.line([(px + 40, py - 5), (px + 40, py + 20)], fill=(255, 255, 255, 200), width=2)
             draw.polygon([(px + 35, py + 20), (px + 45, py + 20), (px + 40, py + 30)],
                          fill=(255, 255, 255, 200))
@@ -706,12 +976,12 @@ def annotate_chart(image_bytes: bytes, vision_data: dict) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VISION AI — Analyzes chart, returns setup detection + annotation coords
+# VISION AI — v3.3: Prompt updated to specify 5M timeframe context
 # ══════════════════════════════════════════════════════════════════════════════
 
 VISION_PROMPT = """You are Jayce, a crypto chart analysis AI trained on 222+ real setups.
 
-Analyze this chart and determine if it shows a Wiz Fib + Flip Zone setup.
+Analyze this 5-MINUTE TIMEFRAME chart and determine if it shows a Wiz Fib + Flip Zone setup.
 
 SETUP TYPES (must be one of these):
 - "382 + Flip Zone" — .382 fib retracement with flip zone
@@ -726,6 +996,11 @@ WHAT TO LOOK FOR:
 3. FLIP ZONE: Previous resistance area that price broke through, now acting as support
 4. Price should be APPROACHING or AT the flip zone (not already bounced)
 
+STRUCTURE QUALITY:
+- If the chart is choppy, messy, sideways, or has no clear impulse, say so in reasoning
+- If the structure is clean and textbook, note that too
+- Be honest about what you see — do not force a setup that isn't there
+
 RESPOND IN THIS EXACT JSON FORMAT:
 {
     "is_setup": true/false,
@@ -733,6 +1008,7 @@ RESPOND IN THIS EXACT JSON FORMAT:
     "fib_depth": ".618",
     "confidence": 75,
     "stage": "testing/forming/confirmed",
+    "structure_quality": "clean/moderate/choppy",
     "reasoning": "Brief explanation of what you see",
     "impulse_percentage": "45",
     "fib_levels": {".382": 35, ".5": 45, ".618": 55, ".786": 65},
@@ -756,7 +1032,7 @@ breakout_x / breakout_y: where the impulse breakout started.
 entry_x: where the bounce path should start (current price approach area).
 touch1_x / touch2_x: X positions where price touched the flip zone.
 
-If NOT a setup, return: {"is_setup": false, "reasoning": "explanation"}"""
+If NOT a setup, return: {"is_setup": false, "structure_quality": "choppy/none", "reasoning": "explanation"}"""
 
 
 async def analyze_chart_vision(image_bytes: bytes, symbol: str) -> dict:
@@ -776,20 +1052,19 @@ async def analyze_chart_vision(image_bytes: bytes, symbol: str) -> dict:
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-                    {"type": "text", "text": f"Token: {symbol}\n\n{VISION_PROMPT}"}
+                    {"type": "text", "text": f"Token: {symbol} | Timeframe: 5M\n\n{VISION_PROMPT}"}
                 ]
             }]
         )
 
         increment_vision_usage()
+        DAILY_METRICS['vision_calls'] += 1
         text = response.content[0].text
 
         # Parse JSON from response
         try:
-            # Try direct parse
             result = json.loads(text)
         except json.JSONDecodeError:
-            # Try to extract JSON from markdown
             import re
             json_match = re.search(r'\{.*\}', text, re.DOTALL)
             if json_match:
@@ -797,7 +1072,9 @@ async def analyze_chart_vision(image_bytes: bytes, symbol: str) -> dict:
             else:
                 result = {'is_setup': False, 'reasoning': 'Could not parse vision response'}
 
-        logger.info(f"🔍 Vision for {symbol}: setup={result.get('is_setup')} type={result.get('setup_type','-')} conf={result.get('confidence',0)}")
+        logger.info(f"🔍 Vision for {symbol}: setup={result.get('is_setup')} "
+                    f"type={result.get('setup_type', '-')} conf={result.get('confidence', 0)} "
+                    f"structure={result.get('structure_quality', '?')}")
         return result
 
     except Exception as e:
@@ -806,11 +1083,12 @@ async def analyze_chart_vision(image_bytes: bytes, symbol: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ALERT SYSTEM — With pattern matching integration
+# ALERT SYSTEM — v3.3: Tier label added, formatting otherwise unchanged
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def send_alert(token: dict, vision_result: dict, chart_bytes: bytes, pattern_data: dict):
-    """Send formatted alert with pattern matching stats."""
+async def send_alert(token: dict, vision_result: dict, chart_bytes: bytes,
+                     pattern_data: dict, tier_name: str, tier_emoji: str, combined_score: float):
+    """Send formatted alert with tier label and pattern matching stats."""
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
         symbol = token.get('symbol', '???')
@@ -835,12 +1113,13 @@ async def send_alert(token: dict, vision_result: dict, chart_bytes: bytes, patte
         match_pct = pattern_data.get('match_percentage', 0) if pattern_data else 0
         conf_text, conf_emoji = get_confidence_level(match_pct) if pattern_data else ("No data", "❓")
 
-        # Build alert message
-        msg = f"""🚨 <b>JAYCE ALERT — {symbol}</b>
+        # ── v3.3: Tier label in header ──
+        msg = f"""🚨 <b>JAYCE ALERT — {symbol}</b> {tier_emoji} <b>{tier_name}</b>
 
 <b>Setup:</b> {setup_type}
 <b>Fib:</b> {fib_depth} | <b>Stage:</b> {stage}
 <b>Vision Confidence:</b> {confidence}%
+<b>Score:</b> {combined_score:.0f}/100
 
 💰 <b>Market Cap:</b> ${mc:,.0f}
 💧 <b>Liquidity:</b> ${liq:,.0f}
@@ -848,7 +1127,6 @@ async def send_alert(token: dict, vision_result: dict, chart_bytes: bytes, patte
 
 📈 <b>1h:</b> {h1:+.1f}% | <b>6h:</b> {h6:+.1f}% | <b>24h:</b> {h24:+.1f}%"""
 
-        # Add pattern matching section
         if pattern_text:
             msg += f"""
 
@@ -886,101 +1164,150 @@ async def send_alert(token: dict, vision_result: dict, chart_bytes: bytes, patte
             )
 
         record_alert_sent(address, setup_type)
-        logger.info(f"✅ Alert sent for {symbol} — {setup_type} — Pattern: {match_pct}%")
+
+        # v3.3: Track metrics by tier
+        if tier_name == 'FORMING':
+            DAILY_METRICS['forming_alerts'] += 1
+        elif tier_name == 'VALID':
+            DAILY_METRICS['valid_alerts'] += 1
+        elif tier_name == 'CONFIRMED':
+            DAILY_METRICS['confirmed_alerts'] += 1
+
+        logger.info(f"✅ Alert sent for {symbol} — {setup_type} — {tier_emoji} {tier_name} — Score: {combined_score:.0f}")
 
     except Exception as e:
         logger.error(f"❌ Alert send error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN SCAN PIPELINE — The full flow with pattern matching gate
+# MAIN SCAN PIPELINE — v3.3: Scoring system + tiered alerts + hard blocks
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def process_token(token: dict, browser) -> bool:
-    """Full pipeline: pre-filter → screenshot → vision → pattern match → alert."""
+    """
+    Full pipeline: pre-filter → vision gate → screenshot → vision → hard block →
+    pattern match → scoring → tier → dedup → alert.
+    """
     symbol = token.get('symbol', '???')
     address = token.get('address', '')
 
-    # Step 1: Pre-filter
+    DAILY_METRICS['coins_scanned'] += 1
+
+    # ═══════════════════════════════════════════════
+    # Stage A: Cheap Pre-Filter (NO Vision cost)
+    # ═══════════════════════════════════════════════
+
+    # Step 1: Basic filters
     passed, reason = pre_filter_token(token)
     if not passed:
         return False
 
-    # Step 2: Check if vision is warranted
+    DAILY_METRICS['coins_passed_prefilter'] += 1
+
+    # Step 2: Vision gate — should we spend a vision call?
     should_vision, trigger, stage = should_use_vision(token)
     if not should_vision:
+        DAILY_METRICS['blocked_no_impulse'] += 1
         return False
 
-    # Step 3: Screenshot
+    # Step 3: Vision budget check
+    if not can_use_vision():
+        logger.warning(f"⚠️ Vision budget exhausted — skipping {symbol}")
+        return False
+
+    # ═══════════════════════════════════════════════
+    # Stage B: Vision Confirmation (costs 1 credit)
+    # ═══════════════════════════════════════════════
+
+    # Step 4: Screenshot (5M timeframe forced)
     pair_address = token.get('pair_address', '')
     if not pair_address:
         return False
 
-    logger.info(f"📸 Screenshotting {symbol}...")
+    logger.info(f"📸 Screenshotting {symbol} (5M)...")
     chart_bytes = await screenshot_chart(pair_address, symbol, browser)
     if not chart_bytes:
         logger.warning(f"⚠️ No chart for {symbol}")
         return False
 
-    # Step 4: Vision analysis
-    logger.info(f"🔍 Analyzing {symbol} with Vision...")
+    # Step 5: Vision analysis
+    logger.info(f"🔍 Analyzing {symbol} with Vision (5M)...")
     vision_result = await analyze_chart_vision(chart_bytes, symbol)
 
+    # ═══════════════════════════════════════════════
+    # Hard Block Checks (anti-spam)
+    # ═══════════════════════════════════════════════
+
+    blocked, block_reason = hard_block_check(token, vision_result)
+    if blocked:
+        DAILY_METRICS['blocked_choppy'] += 1
+        logger.info(f"🚫 {symbol}: HARD BLOCKED — {block_reason}")
+        return False
+
+    # ═══════════════════════════════════════════════
+    # Scoring System (replaces hard gates)
+    # ═══════════════════════════════════════════════
+
+    vision_confidence = vision_result.get('confidence', 0)
+
+    # If Vision says not a setup but gave some confidence, use it at reduced value
     if not vision_result.get('is_setup', False):
-        logger.info(f"❌ {symbol}: Not a setup — {vision_result.get('reasoning', '?')}")
-        return False
+        # Vision rejected — heavily penalize but don't zero out
+        # (allows high pattern match to still surface a FORMING alert)
+        vision_confidence = vision_confidence * 0.3
 
+    # Pattern matching
     setup_type = vision_result.get('setup_type', '')
-    confidence = vision_result.get('confidence', 0)
-
-    if confidence < MIN_MATCH_PERCENT:
-        logger.info(f"⚠️ {symbol}: Vision confidence too low ({confidence}%)")
-        return False
-
-    # ═══════════════════════════════════════════════
-    # Step 5: PATTERN MATCHING — The new gate
-    # ═══════════════════════════════════════════════
-    logger.info(f"🧠 Running pattern match for {symbol} — {setup_type}...")
+    logger.info(f"🧠 Running pattern match for {symbol} — {setup_type} (5M)...")
 
     await ensure_training_data()
 
-    timeframe = '15M'  # Default for now
-    pattern_data = get_pattern_matches(setup_type, timeframe, symbol)
+    pattern_data = get_pattern_matches(setup_type, CHART_TIMEFRAME, symbol)
+    pattern_score = pattern_data.get('best_match_score', 0) * 100  # Convert 0-1 to 0-100
 
-    total_trained = pattern_data.get('total_trained', 0)
-    match_pct = pattern_data.get('match_percentage', 0)
-    best_score = pattern_data.get('best_match_score', 0)
+    # If no training data exists, use a baseline so scoring doesn't zero out
+    if pattern_data.get('total_trained', 0) == 0:
+        # No training data for this setup type — use neutral score
+        pattern_score = 40  # Neutral baseline
 
-    # Pattern match gate
-    if total_trained > 0:
-        # We have training data for this setup type
-        combined_score = int(best_score * 100)
+    # ── Combined Score ──
+    combined_score = calculate_setup_score(vision_confidence, pattern_score)
 
-        if combined_score < MIN_PATTERN_SCORE:
-            logger.info(f"🚫 {symbol}: Pattern score too low ({combined_score}%) — BLOCKED")
-            return False
+    logger.info(f"📊 {symbol}: Vision={vision_confidence:.0f} Pattern={pattern_score:.0f} "
+                f"Combined={combined_score:.0f} (threshold: {SCORE_FORMING})")
 
-        logger.info(f"✅ {symbol}: Pattern score {combined_score}% — {pattern_data['total_matches']}/{total_trained} matches — PASSING")
-    else:
-        # No training data for this exact setup type
-        # Still allow if vision confidence is very high
-        if confidence < 80:
-            logger.info(f"⚠️ {symbol}: No training data for {setup_type} and confidence only {confidence}% — BLOCKED")
-            return False
-        logger.info(f"⚠️ {symbol}: No training data but high confidence ({confidence}%) — allowing")
+    # ── Determine Tier ──
+    tier_name, tier_emoji, dedup_hours = get_alert_tier(combined_score)
 
-    # Step 6: Send alert!
-    logger.info(f"🚨 ALERT: {symbol} — {setup_type} — Pattern: {match_pct}%")
-    await send_alert(token, vision_result, chart_bytes, pattern_data)
+    if tier_name is None:
+        DAILY_METRICS['blocked_low_score'] += 1
+        logger.info(f"⚠️ {symbol}: Score {combined_score:.0f} below FORMING threshold ({SCORE_FORMING}) — BLOCKED")
+        return False
+
+    # ── Tier-aware Dedup ──
+    if was_alert_sent(address, setup_type or 'ANY', dedup_hours):
+        logger.info(f"🔄 {symbol}: Alert already sent within {dedup_hours}h dedup window for {tier_name}")
+        return False
+
+    # ═══════════════════════════════════════════════
+    # Send Alert!
+    # ═══════════════════════════════════════════════
+
+    logger.info(f"🚨 ALERT: {symbol} — {setup_type} — {tier_emoji} {tier_name} — Score: {combined_score:.0f}")
+    await send_alert(token, vision_result, chart_bytes, pattern_data,
+                     tier_name, tier_emoji, combined_score)
     return True
 
 
 async def scan_top_movers(browser):
     """Scan top movers from DexScreener."""
+    reset_metrics_if_new_day()
+
     logger.info("═" * 50)
-    logger.info("🔍 SCANNING TOP MOVERS...")
-    logger.info(f"   Pattern match minimum: {MIN_PATTERN_SCORE}%")
+    logger.info("🔍 SCANNING TOP MOVERS (5M)...")
+    logger.info(f"   Scoring: {SCORE_FORMING} FORMING / {SCORE_VALID} VALID / {SCORE_CONFIRMED} CONFIRMED")
     logger.info(f"   Training data: {len(TRAINING_DATA)} charts loaded")
+    logger.info(f"   Vision budget: {get_vision_usage_today()}/{DAILY_VISION_CAP} used today")
     logger.info("═" * 50)
 
     tokens = await fetch_top_movers()
@@ -995,16 +1322,20 @@ async def scan_top_movers(browser):
         if not address:
             continue
 
-        # Fetch full data
-        full_data = await fetch_token_data(address)
-        if not full_data:
-            continue
+        # Fetch full data (skip if already populated from volume source)
+        if not token.get('price_change_1h') and token.get('price_change_1h') != 0:
+            full_data = await fetch_token_data(address)
+            if not full_data:
+                continue
+            token.update(full_data)
+        elif not token.get('pair_address'):
+            # Have price data but missing pair address — fetch it
+            full_data = await fetch_token_data(address)
+            if full_data:
+                token.update(full_data)
 
-        # Merge
-        token.update(full_data)
-
-        # Check if it had an impulse
-        if not detect_impulse(token):
+        # Check if it had an impulse (Stage A cheap filter)
+        if not detect_impulse(token) and not detect_fresh_runner(token):
             continue
 
         # Add to watchlist
@@ -1015,12 +1346,13 @@ async def scan_top_movers(browser):
             if await process_token(token, browser):
                 alerts_sent += 1
         except Exception as e:
-            logger.error(f"❌ Error processing {token.get('symbol','???')}: {e}")
+            logger.error(f"❌ Error processing {token.get('symbol', '???')}: {e}")
 
         # Rate limit
         await asyncio.sleep(2)
 
     logger.info(f"✅ Scan complete — {alerts_sent} alerts sent")
+    log_current_metrics()
     return alerts_sent
 
 
@@ -1030,7 +1362,7 @@ async def scan_watchlist(browser):
     if not watchlist:
         return
 
-    logger.info(f"👀 Checking {len(watchlist)} watchlist tokens...")
+    logger.info(f"👀 Checking {len(watchlist)} watchlist tokens (5M)...")
     alerts_sent = 0
 
     for token in watchlist:
@@ -1045,13 +1377,14 @@ async def scan_watchlist(browser):
         token.update(full_data)
         update_watchlist_token(address, full_data)
 
+        # Stage A gate — same budget-safe logic
         should_vision, trigger, stage = should_use_vision(token)
         if should_vision and can_use_vision():
             try:
                 if await process_token(token, browser):
                     alerts_sent += 1
             except Exception as e:
-                logger.error(f"❌ Watchlist error for {token.get('symbol','???')}: {e}")
+                logger.error(f"❌ Watchlist error for {token.get('symbol', '???')}: {e}")
             await asyncio.sleep(2)
 
     logger.info(f"👀 Watchlist check done — {alerts_sent} alerts")
@@ -1062,11 +1395,14 @@ async def scan_watchlist(browser):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def main():
-    """Main scanner loop with pattern matching."""
+    """Main scanner loop with scoring system."""
     logger.info("═" * 60)
-    logger.info("🤖 JAYCE SCANNER v3.2 — PATTERN MATCHING EDITION")
+    logger.info("🤖 JAYCE SCANNER v3.3 — SCORING + 5M + TIERED ALERTS")
     logger.info(f"   Kill switch: {'🟢 ON' if ALERTS_ENABLED else '🔴 OFF'}")
-    logger.info(f"   Min pattern score: {MIN_PATTERN_SCORE}%")
+    logger.info(f"   Timeframe: {CHART_TIMEFRAME}")
+    logger.info(f"   Scoring: FORMING={SCORE_FORMING} VALID={SCORE_VALID} CONFIRMED={SCORE_CONFIRMED}")
+    logger.info(f"   Weights: Vision={VISION_WEIGHT} Pattern={PATTERN_WEIGHT}")
+    logger.info(f"   Dedup: F={DEDUP_FORMING_HOURS}h V={DEDUP_VALID_HOURS}h C={DEDUP_CONFIRMED_HOURS}h")
     logger.info(f"   Vision cap: {DAILY_VISION_CAP}/day")
     logger.info(f"   Charts per scan: {CHARTS_PER_SCAN}")
     logger.info("═" * 60)
@@ -1079,12 +1415,15 @@ async def main():
     # Initialize DB
     init_database()
 
+    # Initialize metrics
+    reset_metrics_if_new_day()
+
     # Load training data from GitHub
     logger.info("📥 Loading training data from GitHub...")
     await load_training_from_github()
 
     if not TRAINING_DATA:
-        logger.warning("⚠️ No training data loaded — pattern matching will use fallback mode")
+        logger.warning("⚠️ No training data loaded — pattern matching will use neutral baseline")
     else:
         logger.info(f"✅ {len(TRAINING_DATA)} training charts loaded")
         for setup_name, stats in TRAINED_SETUPS.items():
@@ -1097,12 +1436,13 @@ async def main():
         training_status = f"✅ {len(TRAINING_DATA)} charts" if TRAINING_DATA else "⚠️ No training data"
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🤖 <b>Jayce Scanner v3.2 Online</b>\n\n"
+            text=f"🤖 <b>Jayce Scanner v3.3 Online</b>\n\n"
                  f"Status: {status}\n"
+                 f"Timeframe: {CHART_TIMEFRAME}\n"
                  f"Pattern Match: {training_status}\n"
-                 f"Min Score: {MIN_PATTERN_SCORE}%\n"
+                 f"Scoring: F={SCORE_FORMING} V={SCORE_VALID} C={SCORE_CONFIRMED}\n"
                  f"Vision Cap: {DAILY_VISION_CAP}/day\n\n"
-                 f"<i>Now matching against your real trained setups</i>",
+                 f"<i>Probability-series alerts · Mark Douglas execution</i>",
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
@@ -1141,13 +1481,14 @@ async def main():
                 # Top movers scan
                 await scan_top_movers(browser)
 
-                # Watchlist re-check every N cycles
+                # Watchlist re-check every 3rd cycle
                 if scan_count % 3 == 0:
                     await scan_watchlist(browser)
 
                 # Cleanup
                 if scan_count % 12 == 0:
                     cleanup_old_watchlist()
+                    log_daily_summary()
 
                 # Refresh training data periodically
                 await ensure_training_data()
