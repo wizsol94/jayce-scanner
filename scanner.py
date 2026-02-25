@@ -815,8 +815,13 @@ async def fetch_top_movers() -> list:
 async def fetch_token_data(token_address: str) -> dict:
     """Fetch detailed token data from DexScreener."""
     try:
+        await asyncio.sleep(0.5)  # Rate limit: avoid 429s from DexScreener
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(f'https://api.dexscreener.com/latest/dex/tokens/{token_address}')
+            if resp.status_code == 429:
+                logger.warning(f"⚠️ DexScreener rate limited for {token_address}, waiting 5s...")
+                await asyncio.sleep(5)
+                resp = await client.get(f'https://api.dexscreener.com/latest/dex/tokens/{token_address}')
             if resp.status_code == 200:
                 data = resp.json()
                 pairs = data.get('pairs', [])
@@ -847,17 +852,18 @@ async def fetch_token_data(token_address: str) -> dict:
 # CHART SCREENSHOT — v3.3: Forces 5M timeframe
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
-    """Capture TradingView chart from DexScreener. v3.3: Forces 5M timeframe."""
+async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes:
+    """Capture chart from GeckoTerminal (DexScreener blocks headless browsers)."""
     if not pair_address:
         logger.warning(f"⚠️ No pair address for {symbol}")
         return None
 
-    url = f"https://dexscreener.com/solana/{pair_address}"
+    # GeckoTerminal embed mode: clean chart, no sidebar clutter
+    url = f"https://www.geckoterminal.com/solana/pools/{pair_address}?embed=1&info=0&swaps=0"
     page = None
 
     try:
-        page = await browser.new_page(viewport={'width': 1400, 'height': 900})
+        page = await browser_ctx.new_page()
         await page.goto(url, wait_until='domcontentloaded', timeout=30000)
         await asyncio.sleep(5)
 
@@ -1345,7 +1351,7 @@ async def send_alert(token: dict, vision_result: dict, chart_bytes: bytes,
 # MAIN SCAN PIPELINE — v3.3: Scoring system + tiered alerts + hard blocks
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def process_token(token: dict, browser) -> bool:
+async def process_token(token: dict, browser_ctx) -> bool:
     """
     Full pipeline: pre-filter → vision gate → screenshot → vision → hard block →
     pattern match → scoring → tier → dedup → alert.
@@ -1394,7 +1400,7 @@ async def process_token(token: dict, browser) -> bool:
         return False
 
     logger.info(f"📸 Screenshotting {symbol} (5M)...")
-    chart_bytes = await screenshot_chart(pair_address, symbol, browser)
+    chart_bytes = await screenshot_chart(pair_address, symbol, browser_ctx)
     if not chart_bytes:
         logger.warning(f"⚠️ No chart for {symbol}")
         return False
@@ -1470,7 +1476,7 @@ async def process_token(token: dict, browser) -> bool:
     return True
 
 
-async def scan_top_movers(browser):
+async def scan_top_movers(browser_ctx):
     """Scan top movers from DexScreener."""
     reset_metrics_if_new_day()
 
@@ -1514,7 +1520,7 @@ async def scan_top_movers(browser):
 
         # Process through full pipeline
         try:
-            if await process_token(token, browser):
+            if await process_token(token, browser_ctx):
                 alerts_sent += 1
         except Exception as e:
             logger.error(f"❌ Error processing {token.get('symbol', '???')}: {e}")
@@ -1527,7 +1533,7 @@ async def scan_top_movers(browser):
     return alerts_sent
 
 
-async def scan_watchlist(browser):
+async def scan_watchlist(browser_ctx):
     """Re-check watchlist tokens for developing setups."""
     watchlist = get_watchlist()
     if not watchlist:
@@ -1552,7 +1558,7 @@ async def scan_watchlist(browser):
         should_vision, trigger, stage = should_use_vision(token)
         if should_vision and can_use_vision():
             try:
-                if await process_token(token, browser):
+                if await process_token(token, browser_ctx):
                     alerts_sent += 1
             except Exception as e:
                 logger.error(f"❌ Watchlist error for {token.get('symbol', '???')}: {e}")
@@ -1697,12 +1703,42 @@ async def main():
                 logger.info("🟢 Scanner resumed!")
                 break
 
-    # Launch browser
+    # Launch browser with anti-detection settings
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-web-security',
+                '--window-size=1400,900',
+            ]
         )
+
+        # Create context with real browser fingerprint
+        context = await browser.new_context(
+            viewport={'width': 1400, 'height': 900},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            locale='en-US',
+            timezone_id='America/New_York',
+            extra_http_headers={
+                'Accept-Language': 'en-US,en;q=0.9',
+                'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+            }
+        )
+
+        # Remove webdriver flag that sites use to detect automation
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            window.chrome = { runtime: {} };
+        """)
 
         logger.info("🌐 Browser launched — starting scan loop")
 
@@ -1728,11 +1764,11 @@ async def main():
                 scan_count += 1
 
                 # Top movers scan
-                await scan_top_movers(browser)
+                await scan_top_movers(context)
 
                 # Watchlist re-check every 3rd cycle
                 if scan_count % 3 == 0:
-                    await scan_watchlist(browser)
+                    await scan_watchlist(context)
 
                 # Cleanup
                 if scan_count % 12 == 0:
