@@ -888,52 +888,54 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
         if not tf_selected:
             logger.warning(f"⚠️ {symbol}: Could not select 5M timeframe, using default")
 
-        # Wait for TradingView chart canvas to render
-        canvas_loaded = False
+        # Wait for chart to render (DexScreener uses SVGs, not canvas)
+        chart_loaded = False
         for attempt in range(20):
             try:
-                # Method 1: TradingView iframe
-                iframe_count = await page.locator('iframe[src*="tradingview"]').count()
-                if iframe_count > 0:
-                    frame = page.frame_locator('iframe[src*="tradingview"]')
-                    canvas_count = await frame.locator('canvas').count()
-                    if canvas_count >= 2:
-                        canvas_loaded = True
-                        logger.info(f"📊 {symbol}: Chart loaded via TradingView iframe ({canvas_count} canvases)")
-                        break
-
-                # Method 2: Direct canvases on page
-                canvas_count = await page.locator('canvas').count()
-                if canvas_count >= 2:
-                    canvas_loaded = True
-                    logger.info(f"📊 {symbol}: Chart loaded via direct canvases ({canvas_count} found)")
+                # Method 1: Check for chart elements inside iframes
+                for frame_info in page.frames:
+                    try:
+                        svg_count = await frame_info.locator('svg').count()
+                        canvas_count = await frame_info.locator('canvas').count()
+                        if svg_count >= 3 or canvas_count >= 2:
+                            chart_loaded = True
+                            logger.info(f"📊 {symbol}: Chart loaded in frame ({svg_count} svg, {canvas_count} canvas)")
+                            break
+                    except: pass
+                if chart_loaded:
                     break
 
-                # Method 3: Chart container with canvases
-                chart = page.locator('.chart-container, .tv-chart-container, [class*="chart"]').first
-                if await chart.is_visible(timeout=500):
-                    inner_canvas = await chart.locator('canvas').count()
-                    if inner_canvas >= 1:
-                        canvas_loaded = True
-                        logger.info(f"📊 {symbol}: Chart loaded via container ({inner_canvas} canvases)")
+                # Method 2: SVG-based chart detection on main page
+                svg_count = await page.locator('svg').count()
+                if svg_count >= 20:
+                    path_count = await page.locator('svg path').count()
+                    rect_count = await page.locator('svg rect').count()
+                    if path_count >= 10 or rect_count >= 5:
+                        chart_loaded = True
+                        logger.info(f"📊 {symbol}: Chart loaded via SVG ({svg_count} svg, {path_count} paths, {rect_count} rects)")
                         break
+
+                # Method 3: Any canvas at all
+                canvas_count = await page.locator('canvas').count()
+                if canvas_count >= 1:
+                    chart_loaded = True
+                    logger.info(f"📊 {symbol}: Chart loaded via canvas ({canvas_count} found)")
+                    break
 
             except: pass
             await asyncio.sleep(1)
 
-        if not canvas_loaded:
-            # Debug: log what IS on the page
+        if not chart_loaded:
             try:
                 canvas_count = await page.locator('canvas').count()
                 iframe_count = await page.locator('iframe').count()
                 svg_count = await page.locator('svg').count()
-                logger.warning(f"⚠️ {symbol}: Canvas not detected. Found: {canvas_count} canvas, {iframe_count} iframe, {svg_count} svg — waiting 10s extra")
+                logger.warning(f"⚠️ {symbol}: Chart not detected. {canvas_count} canvas, {iframe_count} iframe, {svg_count} svg — waiting 8s")
             except:
-                logger.warning(f"⚠️ {symbol}: Canvas detection failed — waiting 10s extra")
-            # Give it extra time — chart may render via different mechanism
-            await asyncio.sleep(10)
+                logger.warning(f"⚠️ {symbol}: Chart detection failed — waiting 8s")
+            await asyncio.sleep(8)
 
-        # Extra settle time for candle data to draw
+        # Extra settle time for candle data to fully draw
         await asyncio.sleep(3)
 
         # Try to screenshot just the chart area (multiple selector strategies)
@@ -941,10 +943,12 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
             '#chart-container',           # DexScreener main chart
             '[class*="ChartContainer"]',  # React component naming
             '.chart-container',
-            'div[class*="chart"] canvas',  # Canvas inside chart div
+            '[class*="chart-"]',          # Any chart-related class
+            'div[class*="chart"] svg',    # SVG inside chart div
+            'div[class*="chart"]',        # Chart div itself
             '.tv-chart-container',
             '[class*="tradingview"]',
-            'iframe[src*="tradingview"]',  # TradingView iframe itself
+            'iframe[src*="tradingview"]',
         ]
         for chart_sel in chart_selectors:
             try:
