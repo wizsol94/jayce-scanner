@@ -858,8 +858,8 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
 
     try:
         page = await browser.new_page(viewport={'width': 1400, 'height': 900})
-        await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-        await asyncio.sleep(3)
+        await page.goto(url, wait_until='networkidle', timeout=45000)
+        await asyncio.sleep(5)
 
         # Close popups/modals
         for selector in ['button:has-text("Accept")', 'button:has-text("Got it")',
@@ -879,7 +879,7 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
                 btn = page.locator(tf_sel).first
                 if await btn.is_visible(timeout=2000):
                     await btn.click()
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(3)
                     tf_selected = True
                     logger.info(f"📐 {symbol}: 5M timeframe selected")
                     break
@@ -888,10 +888,11 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
         if not tf_selected:
             logger.warning(f"⚠️ {symbol}: Could not select 5M timeframe, using default")
 
-        # Wait for TradingView chart canvas to render
+        # Wait for TradingView chart canvas to render (longer wait, more patience)
         canvas_loaded = False
-        for attempt in range(25):
+        for attempt in range(35):
             try:
+                # Method 1: TradingView iframe
                 iframe_count = await page.locator('iframe[src*="tradingview"]').count()
                 if iframe_count > 0:
                     frame = page.frame_locator('iframe[src*="tradingview"]')
@@ -900,11 +901,13 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
                         canvas_loaded = True
                         break
 
+                # Method 2: Direct canvases on page
                 canvas_count = await page.locator('canvas').count()
                 if canvas_count >= 3:
                     canvas_loaded = True
                     break
 
+                # Method 3: Chart container with canvases
                 chart = page.locator('.chart-container, .tv-chart-container, [class*="chart"]').first
                 if await chart.is_visible(timeout=500):
                     inner_canvas = await chart.locator('canvas').count()
@@ -918,7 +921,8 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
         if not canvas_loaded:
             logger.warning(f"⚠️ Chart canvas may not have loaded for {symbol}, taking screenshot anyway")
 
-        await asyncio.sleep(2)
+        # Extra settle time after canvas detected
+        await asyncio.sleep(3)
 
         # Try to screenshot just the chart area
         for chart_sel in ['.chart-container', '[class*="chart"]', '.tv-chart-container']:
@@ -1521,6 +1525,14 @@ async def check_telegram_commands():
     global SCANNER_PAUSED, LAST_TELEGRAM_UPDATE_ID
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+    # Delete any existing webhook — webhook + getUpdates can't coexist (causes 409 Conflict)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("🔗 Webhook deleted — switching to polling mode")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not delete webhook: {e}")
+
     logger.info("🎮 Telegram command listener started (/pause /resume /status)")
 
     while True:
