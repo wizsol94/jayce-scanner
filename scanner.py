@@ -853,125 +853,89 @@ async def fetch_token_data(token_address: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes:
-    """Capture chart from GeckoTerminal (DexScreener blocks headless browsers)."""
+    """Render chart from OHLCV API data — no browser needed, bot-proof."""
     if not pair_address:
         logger.warning(f"⚠️ No pair address for {symbol}")
         return None
 
-    # GeckoTerminal embed mode: clean chart, no sidebar clutter
-    url = f"https://www.geckoterminal.com/solana/pools/{pair_address}?embed=1&info=0&swaps=0"
-    page = None
-
     try:
-        page = await browser_ctx.new_page()
-        await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-        await asyncio.sleep(5)
+        import mplfinance as mpf
+        import pandas as pd
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
 
-        # Close popups/modals
-        for selector in ['button:has-text("Accept")', 'button:has-text("Got it")',
-                         'button:has-text("Close")', '[aria-label="Close"]', '.modal-close']:
-            try:
-                el = page.locator(selector).first
-                if await el.is_visible(timeout=1000):
-                    await el.click()
-                    await asyncio.sleep(0.5)
-            except: pass
+        # Fetch OHLCV data from GeckoTerminal API (5m candles)
+        api_url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pair_address}/ohlcv/minute?aggregate=5&limit=100"
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(api_url, headers={'Accept': 'application/json'})
 
-        # ── v3.3: Force 5M timeframe (was 15m) ──
-        tf_selected = False
-        for tf_sel in ['button:has-text("5m")', 'button:has-text("5M")',
-                       '[data-timeframe="5"]', 'button:has-text("5")']:
-            try:
-                btn = page.locator(tf_sel).first
-                if await btn.is_visible(timeout=2000):
-                    await btn.click()
-                    await asyncio.sleep(3)
-                    tf_selected = True
-                    logger.info(f"📐 {symbol}: 5M timeframe selected")
-                    break
-            except: pass
+        if resp.status_code != 200:
+            logger.warning(f"⚠️ {symbol}: GeckoTerminal OHLCV returned {resp.status_code}")
+            return None
 
-        if not tf_selected:
-            logger.warning(f"⚠️ {symbol}: Could not select 5M timeframe, using default")
+        data = resp.json()
+        ohlcv_list = data.get('data', {}).get('attributes', {}).get('ohlcv_list', [])
 
-        # Wait for chart to render (DexScreener uses SVGs, not canvas)
-        chart_loaded = False
-        for attempt in range(20):
-            try:
-                # Method 1: Check for chart elements inside iframes
-                for frame_info in page.frames:
-                    try:
-                        svg_count = await frame_info.locator('svg').count()
-                        canvas_count = await frame_info.locator('canvas').count()
-                        if svg_count >= 3 or canvas_count >= 2:
-                            chart_loaded = True
-                            logger.info(f"📊 {symbol}: Chart loaded in frame ({svg_count} svg, {canvas_count} canvas)")
-                            break
-                    except: pass
-                if chart_loaded:
-                    break
+        if not ohlcv_list or len(ohlcv_list) < 10:
+            logger.warning(f"⚠️ {symbol}: Only {len(ohlcv_list) if ohlcv_list else 0} candles")
+            return None
 
-                # Method 2: SVG-based chart detection on main page
-                svg_count = await page.locator('svg').count()
-                if svg_count >= 20:
-                    path_count = await page.locator('svg path').count()
-                    rect_count = await page.locator('svg rect').count()
-                    if path_count >= 10 or rect_count >= 5:
-                        chart_loaded = True
-                        logger.info(f"📊 {symbol}: Chart loaded via SVG ({svg_count} svg, {path_count} paths, {rect_count} rects)")
-                        break
+        # Convert to DataFrame
+        rows = []
+        for candle in ohlcv_list:
+            ts = candle[0]
+            o, h, l, c, v = float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4]), float(candle[5])
+            rows.append({'Date': datetime.fromtimestamp(ts), 'Open': o, 'High': h, 'Low': l, 'Close': c, 'Volume': v})
 
-                # Method 3: Any canvas at all
-                canvas_count = await page.locator('canvas').count()
-                if canvas_count >= 1:
-                    chart_loaded = True
-                    logger.info(f"📊 {symbol}: Chart loaded via canvas ({canvas_count} found)")
-                    break
+        df = pd.DataFrame(rows)
+        df.set_index('Date', inplace=True)
+        df.sort_index(inplace=True)
 
-            except: pass
-            await asyncio.sleep(1)
+        # Dark style similar to DexScreener/TradingView
+        mc = mpf.make_marketcolors(
+            up='#00c853', down='#ff1744', edge='inherit', wick='inherit',
+            volume={'up': '#00c85380', 'down': '#ff174480'}
+        )
+        style = mpf.make_mpf_style(
+            base_mpf_style='nightclouds', marketcolors=mc,
+            facecolor='#0d1117', edgecolor='#0d1117', figcolor='#0d1117',
+            gridcolor='#1a1f2e', gridstyle='--', y_on_right=True,
+        )
 
-        if not chart_loaded:
-            try:
-                canvas_count = await page.locator('canvas').count()
-                iframe_count = await page.locator('iframe').count()
-                svg_count = await page.locator('svg').count()
-                logger.warning(f"⚠️ {symbol}: Chart not detected. {canvas_count} canvas, {iframe_count} iframe, {svg_count} svg — waiting 8s")
-            except:
-                logger.warning(f"⚠️ {symbol}: Chart detection failed — waiting 8s")
-            await asyncio.sleep(8)
+        # Render chart
+        buf = BytesIO()
+        fig, axes = mpf.plot(
+            df, type='candle', style=style, volume=True,
+            figsize=(14, 7), returnfig=True, tight_layout=True,
+        )
+        axes[0].set_title(f'{symbol} · 5M', color='white', fontsize=14, fontweight='bold', loc='left')
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight',
+                    facecolor='#0d1117', edgecolor='none')
+        buf.seek(0)
+        chart_bytes = buf.read()
+        plt.close(fig)
 
-        # Extra settle time for candle data to fully draw (GeckoTerminal needs more time)
-        await asyncio.sleep(8)
+        logger.info(f"📸 API chart rendered for {symbol} ({len(chart_bytes)} bytes, {len(df)} candles)")
 
-        # Take full viewport screenshot (most reliable — chart fills top area on GeckoTerminal)
-        screenshot = await page.screenshot(type='png', full_page=False, clip={'x': 0, 'y': 0, 'width': 1400, 'height': 700})
-        logger.info(f"📸 Screenshot for {symbol} ({len(screenshot)} bytes)")
-
-        # DEBUG: Send first 3 screenshots to Telegram
+        # DEBUG: Send first 3 charts to Telegram
         if DAILY_METRICS.get('vision_calls', 0) < 3:
             try:
-                from telegram import Bot
-                import io
                 debug_bot = Bot(token=TELEGRAM_BOT_TOKEN)
                 await debug_bot.send_photo(
                     chat_id=TELEGRAM_CHAT_ID,
-                    photo=io.BytesIO(screenshot),
-                    caption=f"🔬 DEBUG: What Vision sees for {symbol} (GeckoTerminal)"
+                    photo=BytesIO(chart_bytes),
+                    caption=f"🔬 DEBUG: API chart for {symbol} (5M, {len(df)} candles)"
                 )
-                logger.info(f"📤 Debug screenshot sent to Telegram for {symbol}")
+                logger.info(f"📤 Debug chart sent to Telegram for {symbol}")
             except Exception as de:
-                logger.warning(f"⚠️ Could not send debug screenshot: {de}")
+                logger.warning(f"⚠️ Could not send debug chart: {de}")
 
-        return screenshot
+        return chart_bytes
 
     except Exception as e:
-        logger.error(f"❌ Screenshot error for {symbol}: {e}")
+        logger.error(f"❌ Chart render error for {symbol}: {e}")
         return None
-    finally:
-        if page:
-            try: await page.close()
-            except: pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
