@@ -14,23 +14,14 @@ from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JAYCE SCANNER v3 — 4-LAYER DETECTION SYSTEM WITH MARKET MEMORY
+# JAYCE SCANNER v3.1 — BUDGET-SAFE PRE-FILTER FIX
 # ══════════════════════════════════════════════════════════════════════════════
 # 
-# UNCHANGED FROM YOUR ORIGINAL:
-# - Chain: Solana ONLY
-# - DEX: Pump.fun + Pumpswap ONLY
-# - MC: 100K+
-# - Liq: 10K+
-# - Chart: 5M timeframe
-# - Telegram alert formatting
-# - 5 WizTheory setups: 382, 50, 618, 786, Under-Fib Flip Zone
-#
-# UPGRADED:
-# - Layer 1: Top Movers Intake (your 5M + 1H rotation - UNCHANGED)
-# - Layer 2: Impulse Memory System (NEW - tracks coins that pumped)
-# - Layer 3: Post-Impulse Detection (NEW - finds pullback candidates)
-# - Layer 4: Budget-Safe Vision (NEW - pre-filters before API call)
+# FIX: Top Movers now pre-filters BEFORE Vision (was missing!)
+# 
+# Vision ONLY runs when:
+# PRIMARY: Impulse + Cooling (pullback forming)
+# SECONDARY: Fresh runner (h1 >= +25%) marked as "forming"
 #
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -59,22 +50,25 @@ MIN_MARKET_CAP = int(os.getenv('MIN_MARKET_CAP', 100000))  # 100K+
 MIN_LIQUIDITY = int(os.getenv('MIN_LIQUIDITY', 10000))      # 10K+
 
 # ══════════════════════════════════════════════
-# LAYER 2-4 SETTINGS (NEW)
+# LAYER 2-4 SETTINGS
 # ══════════════════════════════════════════════
 
-# Impulse Detection Thresholds - when to add coin to watchlist
+# Impulse Detection Thresholds
 IMPULSE_H24_THRESHOLD = float(os.getenv('IMPULSE_H24_THRESHOLD', 40))   # +40% in 24h
 IMPULSE_H6_THRESHOLD = float(os.getenv('IMPULSE_H6_THRESHOLD', 25))     # +25% in 6h
 IMPULSE_H1_THRESHOLD = float(os.getenv('IMPULSE_H1_THRESHOLD', 15))     # +15% in 1h
 
-# How long to watch coins after impulse
+# Fresh Runner Threshold (secondary trigger)
+FRESH_RUNNER_H1_THRESHOLD = float(os.getenv('FRESH_RUNNER_H1_THRESHOLD', 25))  # +25% in 1h = ripping
+
+# Watchlist duration
 WATCHLIST_DURATION_HOURS = int(os.getenv('WATCHLIST_DURATION_HOURS', 72))  # 72 hours
 
-# Post-Impulse Detection (cooling/pullback) - h1 change range
+# Post-Impulse Detection (cooling/pullback)
 POST_IMPULSE_H1_MIN = float(os.getenv('POST_IMPULSE_H1_MIN', -20))  # Not dumping more than -20%
 POST_IMPULSE_H1_MAX = float(os.getenv('POST_IMPULSE_H1_MAX', 10))   # Not pumping more than +10%
 
-# Vision Budget - max API calls per day
+# Vision Budget
 DAILY_VISION_CAP = int(os.getenv('DAILY_VISION_CAP', 250))
 
 # Scan Frequencies (in minutes)
@@ -103,7 +97,7 @@ def init_database():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Active Structure Watchlist - coins we're monitoring
+    # Active Structure Watchlist
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS watchlist (
             token_address TEXT PRIMARY KEY,
@@ -126,7 +120,7 @@ def init_database():
         )
     ''')
     
-    # Vision usage tracking - budget control
+    # Vision usage tracking
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS vision_usage (
             date TEXT PRIMARY KEY,
@@ -134,25 +128,13 @@ def init_database():
         )
     ''')
     
-    # Alerts sent - avoid duplicates
+    # Alerts sent
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS alerts_sent (
             token_address TEXT,
             setup_type TEXT,
             sent_at TIMESTAMP,
             PRIMARY KEY (token_address, setup_type)
-        )
-    ''')
-    
-    # Daily stats
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS daily_stats (
-            date TEXT PRIMARY KEY,
-            coins_scanned INTEGER DEFAULT 0,
-            impulses_detected INTEGER DEFAULT 0,
-            near_triggers INTEGER DEFAULT 0,
-            setups_found INTEGER DEFAULT 0,
-            alerts_sent INTEGER DEFAULT 0
         )
     ''')
     
@@ -186,8 +168,8 @@ def add_to_watchlist(token: dict, source: str = 'MOVERS'):
         token.get('pair_address', ''),
         token.get('symbol', '???'),
         token.get('name', 'Unknown'),
-        now,  # first_seen
-        now,  # last_seen
+        now,
+        now,
         token.get('price_change_24h', 0),
         token.get('price_change_6h', 0),
         token.get('price_change_1h', 0),
@@ -195,7 +177,6 @@ def add_to_watchlist(token: dict, source: str = 'MOVERS'):
         token.get('market_cap', 0),
         token.get('liquidity', 0),
         source,
-        # ON CONFLICT updates:
         now,
         token.get('price_change_24h', 0),
         token.get('price_change_6h', 0),
@@ -239,7 +220,7 @@ def update_watchlist_token(token_address: str, data: dict):
 
 
 def get_watchlist() -> list:
-    """Get all active tokens from watchlist within duration window."""
+    """Get all active tokens from watchlist."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -328,7 +309,6 @@ def was_alert_sent(token_address: str, setup_type: str) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Only check last 24 hours
     cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
     
     cursor.execute('''
@@ -399,18 +379,76 @@ def can_use_vision() -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAYER 1: TOP MOVERS INTAKE (UNCHANGED - Your exact workflow)
+# PRE-FILTER LOGIC — DECIDES IF VISION SHOULD RUN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def should_use_vision(token: dict) -> tuple:
+    """
+    Determine if this token should be sent to Vision.
+    Returns (should_analyze: bool, trigger_type: str, stage_hint: str)
+    
+    PRIMARY TRIGGER (pullback setup):
+    - Had impulse (h1>=+15% OR h6>=+25% OR h24>=+40%)
+    - AND cooling (h1 between -20% and +10%)
+    - Stage = "testing"
+    
+    SECONDARY TRIGGER (fresh runner):
+    - Currently ripping (h1 >= +25%)
+    - Stage = "forming"
+    """
+    
+    h1 = token.get('price_change_1h', 0)
+    h6 = token.get('price_change_6h', 0)
+    h24 = token.get('price_change_24h', 0)
+    
+    # Check for impulse
+    had_impulse = (
+        h24 >= IMPULSE_H24_THRESHOLD or
+        h6 >= IMPULSE_H6_THRESHOLD or
+        h1 >= IMPULSE_H1_THRESHOLD
+    )
+    
+    # Check for cooling/pullback
+    is_cooling = POST_IMPULSE_H1_MIN <= h1 <= POST_IMPULSE_H1_MAX
+    
+    # Check for fresh runner
+    is_ripping = h1 >= FRESH_RUNNER_H1_THRESHOLD
+    
+    # PRIMARY: Impulse + Cooling = potential setup forming
+    if had_impulse and is_cooling:
+        return (True, 'PRIMARY', 'testing')
+    
+    # SECONDARY: Fresh runner = catch early
+    if is_ripping:
+        return (True, 'SECONDARY', 'forming')
+    
+    # No trigger
+    return (False, None, None)
+
+
+def detect_impulse(token: dict) -> bool:
+    """Check if token had an impulse move."""
+    h24 = token.get('price_change_24h', 0)
+    h6 = token.get('price_change_6h', 0)
+    h1 = token.get('price_change_1h', 0)
+    
+    return (
+        h24 >= IMPULSE_H24_THRESHOLD or
+        h6 >= IMPULSE_H6_THRESHOLD or
+        h1 >= IMPULSE_H1_THRESHOLD
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 1: TOP MOVERS INTAKE
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def get_top_movers() -> list:
     """
     YOUR EXACT WORKFLOW:
-    
-    1. Get Top coins from 5M MOVERS (fast action, new coins popping)
-    2. Get Top coins from 1H MOVERS (building momentum)
+    1. Get Top coins from 5M MOVERS
+    2. Get Top coins from 1H MOVERS
     3. Combine unique = ~70 charts
-    
-    This mirrors what you do manually on Dexscreener.
     """
     
     logger.info("")
@@ -420,7 +458,6 @@ async def get_top_movers() -> list:
     logger.info(f"   💧 Liq: ${MIN_LIQUIDITY:,}+")
     logger.info(f"   ⛓️ Chain: Solana")
     logger.info(f"   🏪 DEX: Pump.fun, Pumpswap ONLY")
-    logger.info(f"   🔄 Rotation: 5M + 1H movers")
     logger.info("=" * 60)
     
     all_tokens = {}
@@ -431,10 +468,7 @@ async def get_top_movers() -> list:
             context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
             page = await context.new_page()
             
-            # ══════════════════════════════════════════════
             # ROTATION 1: 5M MOVERS
-            # ══════════════════════════════════════════════
-            
             logger.info("")
             logger.info("🔥 ROTATION 1: 5M MOVERS")
             
@@ -453,10 +487,7 @@ async def get_top_movers() -> list:
             except Exception as e:
                 logger.error(f"   ❌ 5M scrape error: {e}")
             
-            # ══════════════════════════════════════════════
             # ROTATION 2: 1H MOVERS
-            # ══════════════════════════════════════════════
-            
             logger.info("")
             logger.info("📈 ROTATION 2: 1H MOVERS")
             
@@ -496,15 +527,13 @@ async def scrape_token_list(page) -> list:
     tokens = []
     
     try:
-        # Wait a bit more for content
         await asyncio.sleep(3)
         
-        # Find all token links
         rows = await page.query_selector_all('a[href^="/solana/"]')
         
         seen_addresses = set()
         
-        for row in rows[:100]:  # Get top 100
+        for row in rows[:100]:
             try:
                 href = await row.get_attribute('href')
                 if not href or '/solana/' not in href:
@@ -532,7 +561,7 @@ async def scrape_token_list(page) -> list:
 
 
 async def fetch_token_details(all_tokens: dict) -> list:
-    """Fetch detailed info for tokens via DexScreener API and apply YOUR filters."""
+    """Fetch detailed info for tokens via DexScreener API."""
     
     logger.info("📡 Fetching token details...")
     
@@ -545,7 +574,7 @@ async def fetch_token_details(all_tokens: dict) -> list:
                 api_url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
                 response = await client.get(api_url)
                 
-                await asyncio.sleep(0.1)  # Rate limit
+                await asyncio.sleep(0.1)
                 
                 if response.status_code != 200:
                     continue
@@ -560,13 +589,11 @@ async def fetch_token_details(all_tokens: dict) -> list:
                 liquidity = float(pair.get('liquidity', {}).get('usd', 0) or 0)
                 dex_id = pair.get('dexId', '').lower()
                 
-                # YOUR FILTERS - STRICT (UNCHANGED)
+                # YOUR FILTERS (UNCHANGED)
                 if market_cap < MIN_MARKET_CAP:
                     continue
                 if liquidity < MIN_LIQUIDITY:
                     continue
-                
-                # Only Pump.fun, Pumpswap
                 if 'pump' not in dex_id:
                     continue
                 
@@ -594,7 +621,7 @@ async def fetch_token_details(all_tokens: dict) -> list:
                     'source': token.get('source', '?')
                 }
                 
-                # LAYER 2: Check for impulse and add to watchlist
+                # Add to watchlist if impulse detected
                 if detect_impulse(token_info):
                     add_to_watchlist(token_info, token_info['source'])
                     impulse_detected += 1
@@ -613,7 +640,6 @@ async def fetch_token_details(all_tokens: dict) -> list:
         reverse=True
     )
     
-    # Take top charts
     filtered_tokens = filtered_tokens[:CHARTS_PER_SCAN]
     
     logger.info(f"✅ {len(filtered_tokens)} tokens passed filters")
@@ -622,90 +648,11 @@ async def fetch_token_details(all_tokens: dict) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAYER 2: IMPULSE DETECTION
+# WATCHLIST REFRESH
 # ══════════════════════════════════════════════════════════════════════════════
-
-def detect_impulse(token: dict) -> bool:
-    """
-    Detect if token had an impulse move worth watching.
-    
-    IMPULSE DETECTED when ANY condition occurs:
-    - priceChange.h24 >= +40%
-    - priceChange.h6 >= +25%
-    - priceChange.h1 >= +15%
-    """
-    
-    h24 = token.get('price_change_24h', 0)
-    h6 = token.get('price_change_6h', 0)
-    h1 = token.get('price_change_1h', 0)
-    
-    if h24 >= IMPULSE_H24_THRESHOLD:
-        return True
-    if h6 >= IMPULSE_H6_THRESHOLD:
-        return True
-    if h1 >= IMPULSE_H1_THRESHOLD:
-        return True
-    
-    return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 3: POST-IMPULSE / COOLING DETECTION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def detect_post_impulse(token: dict) -> bool:
-    """
-    Detect coins that had big move but are now cooling/pulling back.
-    
-    POST_IMPULSE if:
-    - Had impulse (h24 >= +40%)
-    - Now cooling: h1 between -20% and +10%
-    
-    These are likely forming WizTheory pullbacks!
-    """
-    
-    h24 = token.get('price_change_24h', 0) or token.get('impulse_h24', 0)
-    h1 = token.get('price_change_1h', 0) or token.get('current_h1', 0)
-    
-    had_impulse = h24 >= IMPULSE_H24_THRESHOLD
-    is_cooling = POST_IMPULSE_H1_MIN <= h1 <= POST_IMPULSE_H1_MAX
-    
-    return had_impulse and is_cooling
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 4: BUDGET-SAFE SETUP DETECTION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def check_near_wiz_trigger(token: dict) -> bool:
-    """
-    Stage A: Cheap Pre-Check (NO Vision)
-    
-    Mark NEAR_WIZ_TRIGGER when:
-    - Coin had prior impulse
-    - Momentum slowing or consolidating
-    - Pullback behavior likely forming
-    
-    Only NEAR_WIZ_TRIGGER coins proceed to Vision.
-    """
-    
-    h24 = token.get('price_change_24h', 0) or token.get('impulse_h24', 0)
-    h1 = token.get('price_change_1h', 0) or token.get('current_h1', 0)
-    
-    # Had significant move
-    had_impulse = h24 >= 30  # Slightly lower threshold
-    
-    # Price is pulling back or consolidating (not pumping or crashing)
-    is_pulling_back = -25 <= h1 <= 15
-    
-    return had_impulse and is_pulling_back
-
 
 async def refresh_watchlist_data():
-    """
-    Refresh current price data for all watchlist tokens.
-    Update NEAR_WIZ_TRIGGER status for each.
-    """
+    """Refresh current price data for watchlist tokens."""
     
     watchlist = get_watchlist()
     
@@ -739,36 +686,37 @@ async def refresh_watchlist_data():
                 if not pair:
                     continue
                 
-                # Current data
                 current_data = {
                     'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
+                    'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
                     'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
                     'market_cap': float(pair.get('marketCap', 0) or 0),
                     'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
                 }
                 
-                # Still meets filters?
                 if current_data['market_cap'] < MIN_MARKET_CAP:
                     continue
                 if current_data['liquidity'] < MIN_LIQUIDITY:
                     continue
                 
-                # Merge with stored impulse data
                 merged = {**token, **current_data}
                 
-                # Check post-impulse (cooling)
-                if detect_post_impulse(merged):
-                    post_impulse_count += 1
+                # Check if should trigger Vision
+                should_analyze, trigger_type, stage_hint = should_use_vision(merged)
                 
-                # Check near trigger
-                is_near_trigger = check_near_wiz_trigger(merged)
-                current_data['near_wiz_trigger'] = is_near_trigger
-                
-                if is_near_trigger:
+                if should_analyze:
                     near_triggers += 1
+                    merged['trigger_type'] = trigger_type
+                    merged['stage_hint'] = stage_hint
                     updated_tokens.append(merged)
                 
-                # Update database
+                # Track post-impulse
+                h24 = merged.get('impulse_h24', 0)
+                h1 = current_data.get('price_change_1h', 0)
+                if h24 >= IMPULSE_H24_THRESHOLD and POST_IMPULSE_H1_MIN <= h1 <= POST_IMPULSE_H1_MAX:
+                    post_impulse_count += 1
+                
+                current_data['near_wiz_trigger'] = should_analyze
                 update_watchlist_token(token['address'], current_data)
                 
             except Exception:
@@ -785,7 +733,7 @@ async def refresh_watchlist_data():
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def screenshot_chart(pair_address: str) -> bytes:
-    """Take a screenshot of the 5M chart from Dexscreener."""
+    """Take a screenshot of the 5M chart."""
     
     url = f"https://dexscreener.com/solana/{pair_address}"
     
@@ -797,7 +745,6 @@ async def screenshot_chart(pair_address: str) -> bytes:
             await page.goto(url, wait_until='domcontentloaded', timeout=60000)
             await asyncio.sleep(4)
             
-            # Click 5m timeframe (YOUR setting)
             try:
                 tf_button = await page.query_selector('button:has-text("5m")')
                 if tf_button:
@@ -817,11 +764,11 @@ async def screenshot_chart(pair_address: str) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHART ANNOTATION (Flash Card Style)
+# CHART ANNOTATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def annotate_chart(image_bytes: bytes, analysis: dict) -> bytes:
-    """Draw annotations on the chart like Wiz Theory flash cards."""
+    """Draw annotations on the chart."""
     
     try:
         img = Image.open(BytesIO(image_bytes))
@@ -835,7 +782,6 @@ def annotate_chart(image_bytes: bytes, analysis: dict) -> bytes:
         confidence = analysis.get('confidence', 0)
         stage = analysis.get('stage', 'forming')
         
-        # Positions (percentages)
         breakout_x = int(annotations.get('breakout_x', 30) * width / 100)
         breakout_y = int(annotations.get('breakout_y', 25) * height / 100)
         entry_x = int(annotations.get('entry_x', 85) * width / 100)
@@ -843,14 +789,12 @@ def annotate_chart(image_bytes: bytes, analysis: dict) -> bytes:
         flip_zone_top = int(annotations.get('flip_zone_top_y', 55) * height / 100)
         flip_zone_bottom = int(annotations.get('flip_zone_bottom_y', 65) * height / 100)
         
-        # Colors
         CYAN = (0, 255, 255)
         MAGENTA = (255, 0, 255)
         GREEN = (0, 255, 0)
         WHITE = (255, 255, 255)
         YELLOW = (255, 255, 0)
         
-        # Fonts
         try:
             font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
             font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
@@ -860,7 +804,7 @@ def annotate_chart(image_bytes: bytes, analysis: dict) -> bytes:
             font_medium = ImageFont.load_default()
             font_small = ImageFont.load_default()
         
-        # 1. FLIP ZONE BOX
+        # FLIP ZONE BOX
         flip_zone_left = int(width * 0.15)
         flip_zone_right = int(width * 0.95)
         
@@ -872,19 +816,15 @@ def annotate_chart(image_bytes: bytes, analysis: dict) -> bytes:
                 width=1
             )
         
-        # 2. FLIP ZONE LABEL
         draw.rectangle([flip_zone_left, flip_zone_bottom + 5, flip_zone_left + 100, flip_zone_bottom + 30], fill=CYAN)
         draw.text((flip_zone_left + 10, flip_zone_bottom + 8), "FLIP ZONE", fill=(0, 0, 0), font=font_small)
         
-        # 3. BREAKOUT LABEL
         draw.rectangle([breakout_x - 50, breakout_y - 30, breakout_x + 50, breakout_y - 5], fill=MAGENTA)
         draw.text((breakout_x - 45, breakout_y - 27), "BREAKOUT", fill=WHITE, font=font_small)
         
-        # 4. ENTRY MARKER
         draw.rectangle([entry_x - 35, entry_y - 12, entry_x + 35, entry_y + 12], fill=GREEN)
         draw.text((entry_x - 28, entry_y - 8), "ENTRY", fill=(0, 0, 0), font=font_small)
         
-        # 5. FIB LEVEL LINE
         if fib_level:
             fib_y = int((flip_zone_top + flip_zone_bottom) / 2)
             for x in range(0, width, 20):
@@ -892,7 +832,7 @@ def annotate_chart(image_bytes: bytes, analysis: dict) -> bytes:
             draw.rectangle([width - 60, fib_y - 15, width - 10, fib_y + 15], fill=(50, 50, 50))
             draw.text((width - 55, fib_y - 10), fib_level, fill=YELLOW, font=font_small)
         
-        # 6. SETUP INFO BOX
+        # SETUP INFO BOX
         info_box_x = 20
         info_box_y = 20
         box_width = 220
@@ -911,7 +851,6 @@ def annotate_chart(image_bytes: bytes, analysis: dict) -> bytes:
         if fib_level:
             draw.text((info_box_x + 10, info_box_y + 75), f"• FIB: {fib_level}", fill=WHITE, font=font_small)
         
-        # Save
         output = BytesIO()
         img.save(output, format='PNG')
         return output.getvalue()
@@ -922,16 +861,11 @@ def annotate_chart(image_bytes: bytes, analysis: dict) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VISION ANALYSIS - STAGE B
+# VISION ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def analyze_chart(image_bytes: bytes, token: dict) -> dict:
-    """
-    Stage B: Vision Confirmation
-    
-    Analyze chart for WizTheory setups.
-    Returns structured result with stage (forming/testing/confirmed).
-    """
+async def analyze_chart(image_bytes: bytes, token: dict, stage_hint: str = None) -> dict:
+    """Analyze chart with Vision API."""
     
     if not can_use_vision():
         logger.warning("   ⚠️ Daily Vision cap reached")
@@ -943,9 +877,15 @@ async def analyze_chart(image_bytes: bytes, token: dict) -> dict:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         image_base64 = base64.b64encode(image_bytes).decode('utf-8')
         
-        prompt = """You are Jayce, a Wiz Theory trading setup detector trained on 219 real winning charts.
+        # Include stage hint if provided
+        stage_context = ""
+        if stage_hint:
+            stage_context = f"\nHINT: This coin appears to be in '{stage_hint}' stage based on price action."
+        
+        prompt = f"""You are Jayce, a Wiz Theory trading setup detector trained on 219 real winning charts.
 
 Analyze this chart for WizTheory SETUPS - be GENEROUS in detection. We want to catch setups EARLY.
+{stage_context}
 
 ═══════════════════════════════════════════════
 WHAT MAKES A SETUP:
@@ -974,15 +914,15 @@ THE 5 SETUP TYPES:
 - Under-Fib Flip Zone (very deep, below .786)
 
 ═══════════════════════════════════════════════
-STAGES (ALERT ON ALL OF THESE):
+STAGES:
 ═══════════════════════════════════════════════
 
-- FORMING: Impulse happened, pullback starting
+- FORMING: Impulse happening NOW or just happened
 - TESTING: Price is at/near a key level
 - CONFIRMED: Price bounced off level
 
 ═══════════════════════════════════════════════
-IMPORTANT RULES:
+IMPORTANT:
 ═══════════════════════════════════════════════
 
 1. Be GENEROUS - alert on potential setups early
@@ -992,22 +932,22 @@ IMPORTANT RULES:
 5. Don't require maximum confluence
 
 Return JSON:
-{
+{{
     "setup_detected": true/false,
     "setup_type": "50 + Flip Zone" (or other type),
     "stage": "forming" | "testing" | "confirmed",
     "confidence": 60-100,
     "fib_level": ".50" (or other),
     "reasoning": "brief explanation",
-    "annotations": {
+    "annotations": {{
         "breakout_x": 30,
         "breakout_y": 20,
         "entry_x": 85,
         "entry_y": 60,
         "flip_zone_top_y": 55,
         "flip_zone_bottom_y": 65
-    }
-}
+    }}
+}}
 
 Only return the JSON."""
 
@@ -1035,12 +975,10 @@ Only return the JSON."""
             ]
         )
         
-        # Track Vision usage
         increment_vision_usage()
         
         result_text = response.content[0].text.strip()
         
-        # Clean JSON
         if result_text.startswith('```'):
             result_text = result_text.split('\n', 1)[1]
             result_text = result_text.rsplit('```', 1)[0]
@@ -1064,7 +1002,7 @@ Only return the JSON."""
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
-    """Send setup alert to Telegram with annotated chart."""
+    """Send setup alert to Telegram."""
     
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("❌ Telegram credentials not set")
@@ -1072,18 +1010,15 @@ async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
     
     setup_type = analysis.get('setup_type', 'Unknown Setup')
     
-    # Check if already sent
     if was_alert_sent(token.get('address', ''), setup_type):
-        logger.info(f"   ⏭️ Alert already sent for this setup")
+        logger.info(f"   ⏭️ Alert already sent")
         return
     
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
         
-        # Annotate chart
         annotated = annotate_chart(image_bytes, analysis)
         
-        # Get setup stats
         setup_stats = TRAINED_SETUPS.get(setup_type, {'count': 0, 'avg_outcome': 0})
         
         stage = analysis.get('stage', 'forming').upper()
@@ -1094,15 +1029,10 @@ async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
         mc = token.get('market_cap', 0)
         liq = token.get('liquidity', 0)
         
-        if mc >= 1000000:
-            mc_str = f"${mc/1000000:.1f}M"
-        else:
-            mc_str = f"${mc/1000:.0f}K"
+        mc_str = f"${mc/1000000:.1f}M" if mc >= 1000000 else f"${mc/1000:.0f}K"
+        liq_str = f"${liq/1000000:.1f}M" if liq >= 1000000 else f"${liq/1000:.0f}K"
         
-        if liq >= 1000000:
-            liq_str = f"${liq/1000000:.1f}M"
-        else:
-            liq_str = f"${liq/1000:.0f}K"
+        trigger_type = token.get('trigger_type', 'SCAN')
         
         message = f"""🔥 <b>JAYCE ALERT</b> 🔥
 
@@ -1112,6 +1042,7 @@ async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
 🎯 <b>Stage:</b> {stage}
 💯 <b>Confidence:</b> {confidence}%
 📐 <b>Fib Level:</b> {fib_level}
+🔍 <b>Trigger:</b> {trigger_type}
 
 💰 <b>MC:</b> {mc_str}
 💧 <b>Liq:</b> {liq_str}
@@ -1126,7 +1057,6 @@ async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
 
 ⏰ {datetime.now().strftime('%I:%M %p')}"""
 
-        # Send with annotated chart
         await bot.send_photo(
             chat_id=TELEGRAM_CHAT_ID,
             photo=BytesIO(annotated),
@@ -1134,7 +1064,6 @@ async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
             parse_mode=ParseMode.HTML
         )
         
-        # Record alert
         record_alert_sent(token.get('address', ''), setup_type)
         
         logger.info(f"   📤 Alert sent!")
@@ -1148,25 +1077,48 @@ async def send_alert(token: dict, analysis: dict, image_bytes: bytes):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def scan_top_movers():
-    """Layer 1 + 4: Scan top movers and analyze with Vision."""
+    """Layer 1 + 4: Scan top movers with PRE-FILTERING before Vision."""
     
     logger.info("")
     logger.info("🔥" + "=" * 58)
     logger.info(f"🔥 TOP MOVERS SCAN at {datetime.now().strftime('%I:%M %p')}")
     logger.info("🔥" + "=" * 58)
     
-    # Get movers (Layer 1)
+    # Get movers
     tokens = await get_top_movers()
     
     if not tokens:
         logger.warning("⚠️ No tokens found")
         return
     
+    # ═══════════════════════════════════════════════════════════════
+    # NEW: PRE-FILTER BEFORE VISION
+    # ═══════════════════════════════════════════════════════════════
+    
+    vision_candidates = []
+    skipped = 0
+    
+    for token in tokens:
+        should_analyze, trigger_type, stage_hint = should_use_vision(token)
+        
+        if should_analyze:
+            token['trigger_type'] = trigger_type
+            token['stage_hint'] = stage_hint
+            vision_candidates.append(token)
+        else:
+            skipped += 1
+    
+    logger.info("")
+    logger.info(f"🎯 PRE-FILTER: {len(vision_candidates)} candidates for Vision (skipped {skipped})")
+    logger.info(f"   PRIMARY (pullback): {sum(1 for t in vision_candidates if t.get('trigger_type') == 'PRIMARY')}")
+    logger.info(f"   SECONDARY (ripping): {sum(1 for t in vision_candidates if t.get('trigger_type') == 'SECONDARY')}")
+    logger.info("")
+    
     vision_start = get_vision_usage_today()
     setups_found = 0
     
-    # Analyze each token (Layer 4)
-    for i, token in enumerate(tokens):
+    # Only analyze pre-filtered candidates
+    for i, token in enumerate(vision_candidates):
         if not can_use_vision():
             logger.warning("⚠️ Vision cap reached")
             break
@@ -1174,37 +1126,26 @@ async def scan_top_movers():
         mc = token.get('market_cap', 0)
         liq = token.get('liquidity', 0)
         h1 = token.get('price_change_1h', 0)
-        h5m = token.get('price_change_5m', 0)
-        source = token.get('source', '?')
+        trigger = token.get('trigger_type', '?')
+        stage_hint = token.get('stage_hint', '')
         
-        if mc >= 1000000:
-            mc_str = f"{mc/1000000:.1f}M"
-        else:
-            mc_str = f"{mc/1000:.0f}K"
+        mc_str = f"{mc/1000000:.1f}M" if mc >= 1000000 else f"{mc/1000:.0f}K"
+        liq_str = f"{liq/1000000:.1f}M" if liq >= 1000000 else f"{liq/1000:.0f}K"
         
-        if liq >= 1000000:
-            liq_str = f"{liq/1000000:.1f}M"
-        else:
-            liq_str = f"{liq/1000:.0f}K"
-        
-        logger.info(f"[{i+1}/{len(tokens)}] {token.get('symbol', '???')} | MC: {mc_str} | Liq: {liq_str} | 1h: {h1:+.1f}% | 5m: {h5m:+.1f}% | {token.get('dex', '')} | {source}")
+        logger.info(f"[{i+1}/{len(vision_candidates)}] {token.get('symbol', '???')} | MC: {mc_str} | 1h: {h1:+.1f}% | {trigger} | {stage_hint}")
         
         try:
-            # Screenshot
             logger.info(f"   📸 Screenshotting...")
             image_bytes = await screenshot_chart(token['pair_address'])
             
             if not image_bytes:
-                logger.info(f"   ⏭️ Screenshot failed")
                 continue
             
-            # Analyze
-            analysis = await analyze_chart(image_bytes, token)
+            analysis = await analyze_chart(image_bytes, token, stage_hint)
             
             if not analysis:
                 continue
             
-            # Check for setup
             if analysis.get('setup_detected') and analysis.get('confidence', 0) >= MIN_MATCH_PERCENT:
                 logger.info(f"   🔥 SETUP FOUND!")
                 await send_alert(token, analysis, image_bytes)
@@ -1221,16 +1162,16 @@ async def scan_top_movers():
     logger.info("")
     logger.info("=" * 60)
     logger.info(f"✅ TOP MOVERS SCAN COMPLETE")
-    logger.info(f"   📊 Scanned: {len(tokens)} tokens")
-    logger.info(f"   🔥 Setups found: {setups_found}")
+    logger.info(f"   📊 Total tokens: {len(tokens)}")
+    logger.info(f"   🎯 Vision candidates: {len(vision_candidates)}")
     logger.info(f"   👁️ Vision calls: {vision_used}")
+    logger.info(f"   🔥 Setups found: {setups_found}")
     logger.info("=" * 60)
 
 
 async def scan_watchlist():
-    """Layer 2 + 3: Scan watchlist for post-impulse setups."""
+    """Layer 2 + 3: Scan watchlist (already pre-filtered)."""
     
-    # Refresh data and get near triggers
     near_triggers = await refresh_watchlist_data()
     
     if not near_triggers:
@@ -1251,7 +1192,10 @@ async def scan_watchlist():
             logger.warning("⚠️ Vision cap reached")
             break
         
-        logger.info(f"[WATCHLIST] {token.get('symbol', '???')} (impulse +{token.get('impulse_h24', 0):.0f}%)")
+        trigger_type = token.get('trigger_type', 'WATCHLIST')
+        stage_hint = token.get('stage_hint', '')
+        
+        logger.info(f"[WATCHLIST] {token.get('symbol', '???')} (impulse +{token.get('impulse_h24', 0):.0f}%) | {trigger_type}")
         
         try:
             image_bytes = await screenshot_chart(token['pair_address'])
@@ -1259,7 +1203,7 @@ async def scan_watchlist():
             if not image_bytes:
                 continue
             
-            analysis = await analyze_chart(image_bytes, token)
+            analysis = await analyze_chart(image_bytes, token, stage_hint)
             
             if not analysis:
                 continue
@@ -1279,7 +1223,7 @@ async def scan_watchlist():
 
 
 async def log_metrics():
-    """Log daily metrics."""
+    """Log metrics."""
     
     watchlist = get_watchlist()
     near_triggers = get_near_wiz_trigger_tokens()
@@ -1296,7 +1240,7 @@ async def log_metrics():
 
 
 async def send_test_alert():
-    """Send a test alert to verify Telegram."""
+    """Send a test alert."""
     
     logger.info("🧪 Sending test alert...")
     
@@ -1307,24 +1251,23 @@ async def send_test_alert():
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
         
-        message = f"""🧪 <b>JAYCE SCANNER v3 TEST</b> 🧪
+        message = f"""🧪 <b>JAYCE SCANNER v3.1 TEST</b> 🧪
 
-✅ Scanner running with 4-Layer Detection:
+✅ Scanner running with BUDGET-SAFE pre-filtering!
 
-📊 Layer 1: Top Movers (5M + 1H rotation)
-🚀 Layer 2: Impulse Memory ({WATCHLIST_DURATION_HOURS}h tracking)
-🔄 Layer 3: Post-Impulse Detection
-🎯 Layer 4: Budget-Safe Vision
+🎯 Vision only runs on:
+• PRIMARY: Impulse + Pullback (setup forming)
+• SECONDARY: Fresh runners (+25% h1)
 
 ⚙️ Settings:
-• Impulse triggers: +{IMPULSE_H24_THRESHOLD}% (24h) / +{IMPULSE_H6_THRESHOLD}% (6h) / +{IMPULSE_H1_THRESHOLD}% (1h)
-• Charts per scan: {CHARTS_PER_SCAN}
-• Min confidence: {MIN_MATCH_PERCENT}%
+• Impulse: +{IMPULSE_H24_THRESHOLD}% (24h) / +{IMPULSE_H6_THRESHOLD}% (6h) / +{IMPULSE_H1_THRESHOLD}% (1h)
+• Fresh runner: +{FRESH_RUNNER_H1_THRESHOLD}% (1h)
+• Cooling range: {POST_IMPULSE_H1_MIN}% to +{POST_IMPULSE_H1_MAX}%
 • Vision cap: {DAILY_VISION_CAP}/day
 
 ⏰ {datetime.now().strftime('%I:%M %p')}
 
-✅ If you see this, Jayce v3 is working!"""
+✅ Pre-filter fix deployed!"""
 
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
@@ -1343,50 +1286,44 @@ async def send_test_alert():
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def main():
-    """Main loop with multi-layer scanning."""
+    """Main loop."""
     
     logger.info("")
     logger.info("🧙‍♂️" + "=" * 58)
-    logger.info("🧙‍♂️ JAYCE SCANNER v3 - MARKET MEMORY EDITION")
+    logger.info("🧙‍♂️ JAYCE SCANNER v3.1 — BUDGET-SAFE PRE-FILTER")
     logger.info("🧙‍♂️" + "=" * 58)
     logger.info("")
-    logger.info("⚙️ YOUR SETTINGS (UNCHANGED):")
+    logger.info("⚙️ YOUR SETTINGS:")
     logger.info(f"   📊 Charts per scan: {CHARTS_PER_SCAN}")
     logger.info(f"   🎯 Min match: {MIN_MATCH_PERCENT}%")
     logger.info(f"   💰 Min MC: ${MIN_MARKET_CAP:,}")
     logger.info(f"   💧 Min Liq: ${MIN_LIQUIDITY:,}")
     logger.info(f"   ⛓️ Chain: Solana ONLY")
     logger.info(f"   🏪 DEX: Pump.fun, Pumpswap ONLY")
-    logger.info(f"   📈 Timeframe: 5M")
     logger.info("")
-    logger.info("🚀 NEW - IMPULSE MEMORY:")
-    logger.info(f"   h24 trigger: +{IMPULSE_H24_THRESHOLD}%")
-    logger.info(f"   h6 trigger: +{IMPULSE_H6_THRESHOLD}%")
-    logger.info(f"   h1 trigger: +{IMPULSE_H1_THRESHOLD}%")
-    logger.info(f"   Watch duration: {WATCHLIST_DURATION_HOURS}h")
+    logger.info("🎯 PRE-FILTER (Vision only when):")
+    logger.info(f"   PRIMARY: Impulse + Cooling")
+    logger.info(f"     - h24 >= +{IMPULSE_H24_THRESHOLD}% OR h6 >= +{IMPULSE_H6_THRESHOLD}% OR h1 >= +{IMPULSE_H1_THRESHOLD}%")
+    logger.info(f"     - AND h1 between {POST_IMPULSE_H1_MIN}% and +{POST_IMPULSE_H1_MAX}%")
+    logger.info(f"   SECONDARY: Fresh runner")
+    logger.info(f"     - h1 >= +{FRESH_RUNNER_H1_THRESHOLD}%")
     logger.info("")
     logger.info(f"👁️ Vision cap: {DAILY_VISION_CAP}/day")
-    logger.info(f"⏱️ Top movers: every {TOP_MOVERS_INTERVAL} min")
-    logger.info(f"⏱️ Watchlist: every {WATCHLIST_INTERVAL} min")
     logger.info("")
     logger.info("=" * 60)
     
-    # Initialize database
     init_database()
     
-    # Install playwright browsers
     logger.info("📦 Installing browsers...")
     import subprocess
     subprocess.run(['playwright', 'install', 'chromium'], check=True)
     logger.info("✅ Ready")
     logger.info("")
     
-    # Send test alert if enabled
     if os.getenv('SEND_TEST_ALERT', 'true').lower() == 'true':
         await send_test_alert()
         logger.info("")
     
-    # Track last scan times
     last_movers_scan = datetime.min
     last_watchlist_scan = datetime.min
     last_metrics = datetime.min
@@ -1395,25 +1332,20 @@ async def main():
         try:
             now = datetime.now()
             
-            # Clean old entries
             cleanup_old_watchlist()
             
-            # Top Movers scan
             if (now - last_movers_scan).total_seconds() >= TOP_MOVERS_INTERVAL * 60:
                 await scan_top_movers()
                 last_movers_scan = now
             
-            # Watchlist scan
             if (now - last_watchlist_scan).total_seconds() >= WATCHLIST_INTERVAL * 60:
                 await scan_watchlist()
                 last_watchlist_scan = now
             
-            # Log metrics every hour
             if (now - last_metrics).total_seconds() >= 3600:
                 await log_metrics()
                 last_metrics = now
             
-            # Check every minute
             await asyncio.sleep(60)
             
         except Exception as e:
