@@ -924,20 +924,29 @@ async def screenshot_chart(pair_address: str, symbol: str, browser) -> bytes:
         # Extra settle time after canvas detected
         await asyncio.sleep(3)
 
-        # Try to screenshot just the chart area
-        for chart_sel in ['.chart-container', '[class*="chart"]', '.tv-chart-container']:
+        # Try to screenshot just the chart area (multiple selector strategies)
+        chart_selectors = [
+            '#chart-container',           # DexScreener main chart
+            '[class*="ChartContainer"]',  # React component naming
+            '.chart-container',
+            'div[class*="chart"] canvas',  # Canvas inside chart div
+            '.tv-chart-container',
+            '[class*="tradingview"]',
+            'iframe[src*="tradingview"]',  # TradingView iframe itself
+        ]
+        for chart_sel in chart_selectors:
             try:
                 el = page.locator(chart_sel).first
-                if await el.is_visible(timeout=2000):
+                if await el.is_visible(timeout=1500):
                     screenshot = await el.screenshot(type='png')
                     if len(screenshot) > 5000:
-                        logger.info(f"📸 Chart screenshot captured for {symbol} ({len(screenshot)} bytes)")
+                        logger.info(f"📸 Chart screenshot captured for {symbol} via '{chart_sel}' ({len(screenshot)} bytes)")
                         return screenshot
             except: pass
 
-        # Fallback: full page
-        screenshot = await page.screenshot(type='png', full_page=False)
-        logger.info(f"📸 Full page screenshot for {symbol} ({len(screenshot)} bytes)")
+        # Fallback: crop top portion of page (chart is always at top on DexScreener)
+        screenshot = await page.screenshot(type='png', full_page=False, clip={'x': 0, 'y': 0, 'width': 1400, 'height': 650})
+        logger.info(f"📸 Cropped screenshot for {symbol} (top 650px, {len(screenshot)} bytes)")
         return screenshot
 
     except Exception as e:
@@ -1530,10 +1539,12 @@ async def check_telegram_commands():
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("🔗 Webhook deleted — switching to polling mode")
+        # Telegram needs time to fully release the webhook before polling works
+        await asyncio.sleep(5)
     except Exception as e:
         logger.warning(f"⚠️ Could not delete webhook: {e}")
 
-    logger.info("🎮 Telegram command listener started (/pause /resume /status)")
+    logger.info("🎮 Telegram command listener ready (/pause /resume /status)")
 
     while True:
         try:
@@ -1585,10 +1596,17 @@ async def check_telegram_commands():
                     )
 
         except Exception as e:
-            # Silently retry — don't spam logs for polling errors
-            if "Conflict" not in str(e):
+            error_str = str(e)
+            if "Conflict" in error_str:
+                # Another polling session or lingering webhook — re-delete and wait
+                try:
+                    await bot.delete_webhook(drop_pending_updates=True)
+                    logger.info("🔗 Re-deleted webhook after 409 Conflict")
+                except: pass
+                await asyncio.sleep(10)
+            else:
                 logger.debug(f"Command listener error: {e}")
-            await asyncio.sleep(5)
+                await asyncio.sleep(5)
 
         await asyncio.sleep(2)  # Poll every 2 seconds
 
@@ -1658,7 +1676,6 @@ async def main():
 
         # v3.3.2: Start Telegram command listener in background
         asyncio.create_task(check_telegram_commands())
-        logger.info("📡 Telegram command listener started (/pause /resume /status)")
 
         scan_count = 0
         while True:
