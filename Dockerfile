@@ -1,13 +1,8 @@
 FROM mcr.microsoft.com/playwright/python:v1.58.0-noble
-
 WORKDIR /app
-
-# Install Python deps only (Playwright + Chromium already in base image)
+# v3.3.2-charts: added mplfinance pandas matplotlib
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy code LAST — this is the only layer that changes on each deploy
 COPY scanner.py .
 COPY railway.toml .
-
 CMD ["python", "scanner.py"]
