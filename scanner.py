@@ -15,18 +15,23 @@ from io import BytesIO
 import math
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JAYCE SCANNER v3.3 — SCORING SYSTEM + 5M TIMEFRAME + TIERED ALERTS
+# JAYCE SCANNER v3.3.1 — SCORING + 5M + TIERED ALERTS + VISION COOLDOWN
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# v3.3 CHANGES:
-# 1. FORCED 5M TIMEFRAME everywhere (screenshots, vision, pattern matching)
-# 2. SCORING SYSTEM replaces hard gates (0.6 vision + 0.4 pattern)
-# 3. THREE ALERT TIERS: FORMING (40+), VALID (55+), CONFIRMED (70+)
-# 4. VOLUME-BASED SCANNING (5m + 1h volume movers, not just boosted)
-# 5. HARD BLOCK conditions (anti-spam)
-# 6. DAILY METRICS LOGGING
-# 7. Budget-safe 2-stage detection preserved
-# 8. NO changes to alert formatting, annotations, DB structure
+# v3.3.1 CHANGES:
+# 1. VISION REJECTION COOLDOWN — 45min cooldown after Vision rejects a token
+# 2. Cooldown overrides: h1 +10% jump, new impulse, 2x volume spike
+# 3. Saves ~50% of wasted Vision credits on re-scans
+# 4. NO changes to alert formatting, annotations, DB structure
+#
+# v3.3 FEATURES (preserved):
+# - FORCED 5M TIMEFRAME everywhere
+# - SCORING SYSTEM (0.6 vision + 0.4 pattern)
+# - THREE ALERT TIERS: FORMING (40+), VALID (55+), CONFIRMED (70+)
+# - VOLUME-BASED SCANNING
+# - HARD BLOCK conditions (anti-spam)
+# - DAILY METRICS LOGGING
+# - Budget-safe 2-stage detection
 #
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -76,6 +81,11 @@ DEDUP_CONFIRMED_HOURS = int(os.getenv('DEDUP_CONFIRMED_HOURS', 24))
 # ── v3.3: Forced timeframe ──
 CHART_TIMEFRAME = os.getenv('CHART_TIMEFRAME', '5M')
 
+# ── v3.3.1: Vision rejection cooldown ──
+VISION_COOLDOWN_MINUTES = int(os.getenv('VISION_COOLDOWN_MINUTES', 45))
+COOLDOWN_H1_OVERRIDE_DELTA = float(os.getenv('COOLDOWN_H1_OVERRIDE_DELTA', 10))  # +10% h1 change to override
+COOLDOWN_VOLUME_SPIKE_MULT = float(os.getenv('COOLDOWN_VOLUME_SPIKE_MULT', 2.0))  # 2x volume to override
+
 # Pattern match minimum (kept for fallback but scoring system is primary gate now)
 MIN_PATTERN_SCORE = int(os.getenv('MIN_PATTERN_SCORE', 50))
 
@@ -110,7 +120,16 @@ DAILY_METRICS = {
     'blocked_no_impulse': 0,
     'blocked_choppy': 0,
     'blocked_low_score': 0,
+    'blocked_cooldown': 0,
+    'cooldown_overrides': 0,
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v3.3.1: VISION REJECTION COOLDOWN — Prevents re-scanning rejected tokens
+# ══════════════════════════════════════════════════════════════════════════════
+# In-memory cache: { token_address: { rejected_at, h1_at_rejection, volume_at_rejection, impulse_h24 } }
+VISION_COOLDOWN_CACHE = {}
 
 
 def reset_metrics_if_new_day():
@@ -144,6 +163,8 @@ def log_daily_summary():
     logger.info(f"   No impulse: {m['blocked_no_impulse']}")
     logger.info(f"   Choppy/invalid: {m['blocked_choppy']}")
     logger.info(f"   Low score: {m['blocked_low_score']}")
+    logger.info(f"   Cooldown saved: {m['blocked_cooldown']}")
+    logger.info(f"   Cooldown overrides: {m['cooldown_overrides']}")
     logger.info("═" * 60)
 
 
@@ -154,7 +175,95 @@ def log_current_metrics():
     logger.info(f"📊 Metrics so far — Scanned: {m['coins_scanned']} | "
                 f"Pre-filter: {m['coins_passed_prefilter']} | "
                 f"Vision: {m['vision_calls']} | "
-                f"Alerts: {total_alerts} (F:{m['forming_alerts']} V:{m['valid_alerts']} C:{m['confirmed_alerts']})")
+                f"Alerts: {total_alerts} (F:{m['forming_alerts']} V:{m['valid_alerts']} C:{m['confirmed_alerts']}) | "
+                f"Cooldown: {m['blocked_cooldown']} saved, {m['cooldown_overrides']} overrides")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v3.3.1: VISION COOLDOWN LOGIC
+# ══════════════════════════════════════════════════════════════════════════════
+
+def record_vision_rejection(token: dict):
+    """Record that Vision rejected this token — start cooldown timer."""
+    address = token.get('address', '')
+    if not address:
+        return
+    VISION_COOLDOWN_CACHE[address] = {
+        'rejected_at': datetime.now(),
+        'h1_at_rejection': token.get('price_change_1h', 0),
+        'volume_at_rejection': token.get('volume_24h', 0),
+        'impulse_h24_at_rejection': token.get('price_change_24h', 0),
+        'symbol': token.get('symbol', '???'),
+    }
+    logger.info(f"⏳ {token.get('symbol', '???')}: Vision cooldown started ({VISION_COOLDOWN_MINUTES}min)")
+
+
+def is_on_vision_cooldown(token: dict) -> tuple:
+    """
+    Check if token is on vision cooldown.
+    Returns (on_cooldown: bool, reason: str).
+    Cooldown can be overridden by:
+      1. h1% increased by 10%+ since last rejection
+      2. New impulse threshold triggered (h24 jumped significantly)
+      3. Significant volume spike (2x+)
+    """
+    address = token.get('address', '')
+    if not address or address not in VISION_COOLDOWN_CACHE:
+        return (False, "Not in cooldown")
+
+    cache = VISION_COOLDOWN_CACHE[address]
+    rejected_at = cache['rejected_at']
+    elapsed_minutes = (datetime.now() - rejected_at).total_seconds() / 60
+
+    # Cooldown expired naturally
+    if elapsed_minutes >= VISION_COOLDOWN_MINUTES:
+        del VISION_COOLDOWN_CACHE[address]
+        return (False, f"Cooldown expired ({elapsed_minutes:.0f}min)")
+
+    # ── Override checks ──
+    current_h1 = token.get('price_change_1h', 0)
+    cached_h1 = cache.get('h1_at_rejection', 0)
+    h1_delta = current_h1 - cached_h1
+
+    # Override 1: h1% increased by 10%+ from last Vision check
+    if h1_delta >= COOLDOWN_H1_OVERRIDE_DELTA:
+        del VISION_COOLDOWN_CACHE[address]
+        DAILY_METRICS['cooldown_overrides'] += 1
+        logger.info(f"🔄 {cache['symbol']}: Cooldown OVERRIDDEN — h1 jumped +{h1_delta:.1f}% since rejection")
+        return (False, f"h1 override: +{h1_delta:.1f}%")
+
+    # Override 2: New impulse threshold triggered
+    current_h24 = token.get('price_change_24h', 0)
+    cached_h24 = cache.get('impulse_h24_at_rejection', 0)
+    if current_h24 >= IMPULSE_H24_THRESHOLD and current_h24 > cached_h24 * 1.25:
+        del VISION_COOLDOWN_CACHE[address]
+        DAILY_METRICS['cooldown_overrides'] += 1
+        logger.info(f"🔄 {cache['symbol']}: Cooldown OVERRIDDEN — new impulse h24={current_h24:.1f}%")
+        return (False, f"impulse override: h24={current_h24:.1f}%")
+
+    # Override 3: Significant volume spike (2x+)
+    current_vol = token.get('volume_24h', 0)
+    cached_vol = cache.get('volume_at_rejection', 0)
+    if cached_vol > 0 and current_vol >= cached_vol * COOLDOWN_VOLUME_SPIKE_MULT:
+        del VISION_COOLDOWN_CACHE[address]
+        DAILY_METRICS['cooldown_overrides'] += 1
+        logger.info(f"🔄 {cache['symbol']}: Cooldown OVERRIDDEN — volume spike {current_vol/cached_vol:.1f}x")
+        return (False, f"volume override: {current_vol/cached_vol:.1f}x")
+
+    # Still on cooldown, no override triggered
+    remaining = VISION_COOLDOWN_MINUTES - elapsed_minutes
+    return (True, f"Cooldown active ({remaining:.0f}min remaining)")
+
+
+def cleanup_expired_cooldowns():
+    """Remove expired entries from cooldown cache."""
+    now = datetime.now()
+    expired = [addr for addr, cache in VISION_COOLDOWN_CACHE.items()
+               if (now - cache['rejected_at']).total_seconds() / 60 >= VISION_COOLDOWN_MINUTES]
+    for addr in expired:
+        del VISION_COOLDOWN_CACHE[addr]
+    if expired:
+        logger.info(f"🧹 Cleaned {len(expired)} expired cooldowns")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1215,6 +1324,13 @@ async def process_token(token: dict, browser) -> bool:
         logger.warning(f"⚠️ Vision budget exhausted — skipping {symbol}")
         return False
 
+    # Step 3.5: Vision rejection cooldown check
+    on_cooldown, cooldown_reason = is_on_vision_cooldown(token)
+    if on_cooldown:
+        DAILY_METRICS['blocked_cooldown'] += 1
+        logger.info(f"⏳ {symbol}: SKIPPED — {cooldown_reason}")
+        return False
+
     # ═══════════════════════════════════════════════
     # Stage B: Vision Confirmation (costs 1 credit)
     # ═══════════════════════════════════════════════
@@ -1242,6 +1358,7 @@ async def process_token(token: dict, browser) -> bool:
     if blocked:
         DAILY_METRICS['blocked_choppy'] += 1
         logger.info(f"🚫 {symbol}: HARD BLOCKED — {block_reason}")
+        record_vision_rejection(token)
         return False
 
     # ═══════════════════════════════════════════════
@@ -1282,6 +1399,7 @@ async def process_token(token: dict, browser) -> bool:
     if tier_name is None:
         DAILY_METRICS['blocked_low_score'] += 1
         logger.info(f"⚠️ {symbol}: Score {combined_score:.0f} below FORMING threshold ({SCORE_FORMING}) — BLOCKED")
+        record_vision_rejection(token)
         return False
 
     # ── Tier-aware Dedup ──
@@ -1397,12 +1515,13 @@ async def scan_watchlist(browser):
 async def main():
     """Main scanner loop with scoring system."""
     logger.info("═" * 60)
-    logger.info("🤖 JAYCE SCANNER v3.3 — SCORING + 5M + TIERED ALERTS")
+    logger.info("🤖 JAYCE SCANNER v3.3.1 — SCORING + 5M + TIERED ALERTS + VISION COOLDOWN")
     logger.info(f"   Kill switch: {'🟢 ON' if ALERTS_ENABLED else '🔴 OFF'}")
     logger.info(f"   Timeframe: {CHART_TIMEFRAME}")
     logger.info(f"   Scoring: FORMING={SCORE_FORMING} VALID={SCORE_VALID} CONFIRMED={SCORE_CONFIRMED}")
     logger.info(f"   Weights: Vision={VISION_WEIGHT} Pattern={PATTERN_WEIGHT}")
     logger.info(f"   Dedup: F={DEDUP_FORMING_HOURS}h V={DEDUP_VALID_HOURS}h C={DEDUP_CONFIRMED_HOURS}h")
+    logger.info(f"   Vision cooldown: {VISION_COOLDOWN_MINUTES}min (override: h1+{COOLDOWN_H1_OVERRIDE_DELTA}%, vol {COOLDOWN_VOLUME_SPIKE_MULT}x)")
     logger.info(f"   Vision cap: {DAILY_VISION_CAP}/day")
     logger.info(f"   Charts per scan: {CHARTS_PER_SCAN}")
     logger.info("═" * 60)
@@ -1436,12 +1555,13 @@ async def main():
         training_status = f"✅ {len(TRAINING_DATA)} charts" if TRAINING_DATA else "⚠️ No training data"
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🤖 <b>Jayce Scanner v3.3 Online</b>\n\n"
+            text=f"🤖 <b>Jayce Scanner v3.3.1 Online</b>\n\n"
                  f"Status: {status}\n"
                  f"Timeframe: {CHART_TIMEFRAME}\n"
                  f"Pattern Match: {training_status}\n"
                  f"Scoring: F={SCORE_FORMING} V={SCORE_VALID} C={SCORE_CONFIRMED}\n"
-                 f"Vision Cap: {DAILY_VISION_CAP}/day\n\n"
+                 f"Vision Cap: {DAILY_VISION_CAP}/day\n"
+                 f"Cooldown: {VISION_COOLDOWN_MINUTES}min\n\n"
                  f"<i>Probability-series alerts · Mark Douglas execution</i>",
             parse_mode=ParseMode.HTML
         )
@@ -1488,6 +1608,7 @@ async def main():
                 # Cleanup
                 if scan_count % 12 == 0:
                     cleanup_old_watchlist()
+                    cleanup_expired_cooldowns()
                     log_daily_summary()
 
                 # Refresh training data periodically
