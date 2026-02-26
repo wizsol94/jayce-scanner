@@ -641,9 +641,9 @@ def pre_filter_token(token: dict) -> tuple:
     if dex and dex not in ALLOWED_DEXES:
         return (False, f"DEX filtered: {dex} (only pump.fun/PumpSwap)")
 
-    # v3.3.3: Profile required — no profile = likely scam
+    # v3.3.3: Profile required — must have image + at least 1 social/website
     if token.get('has_profile') is False:
-        return (False, "No DexScreener profile (scam filter)")
+        return (False, "No profile (needs image + social/website)")
 
     return (True, "Passed pre-filter")
 
@@ -869,9 +869,13 @@ async def fetch_token_data(token_address: str) -> dict:
                 pair = allowed_pair
                 pc = pair.get('priceChange', {})
 
-                # v3.3.3: Check for DexScreener profile (info field)
+                # v3.3.3: Check for DexScreener profile — need image + at least 1 social/website
                 info = pair.get('info', {})
-                has_profile = bool(info and (info.get('imageUrl') or info.get('websites') or info.get('socials')))
+                has_image = bool(info.get('imageUrl'))
+                socials = info.get('socials', [])
+                websites = info.get('websites', [])
+                has_links = len(socials) + len(websites) >= 1
+                has_profile = has_image and has_links
 
                 return {
                     'address': token_address,
@@ -1443,7 +1447,7 @@ async def process_token(token: dict, browser_ctx) -> bool:
     passed, reason = pre_filter_token(token)
     if not passed:
         # v3.3.3: Log DEX and profile rejections for transparency
-        if 'DEX filtered' in reason or 'No DexScreener profile' in reason:
+        if 'DEX filtered' in reason or 'No profile' in reason:
             logger.info(f"🚫 {symbol}: {reason}")
         return False
 
