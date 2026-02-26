@@ -1513,24 +1513,23 @@ async def process_token(token: dict, browser_ctx) -> bool:
         # (allows high pattern match to still surface a FORMING alert)
         vision_confidence = vision_confidence * 0.3
 
-    # Pattern matching
+    # Pattern matching — context only, NOT used for scoring
     setup_type = vision_result.get('setup_type', '')
     logger.info(f"🧠 Running pattern match for {symbol} — {setup_type} (5M)...")
 
     await ensure_training_data()
 
     pattern_data = get_pattern_matches(setup_type, CHART_TIMEFRAME, symbol)
-    pattern_score = pattern_data.get('best_match_score', 0) * 100  # Convert 0-1 to 0-100
 
-    # If no training data exists, use a baseline so scoring doesn't zero out
-    if pattern_data.get('total_trained', 0) == 0:
-        # No training data for this setup type — use neutral score
-        pattern_score = 40  # Neutral baseline
+    # v3.3.3: Pattern score locked at neutral baseline.
+    # Pattern match currently only compares labels, not actual chart structure.
+    # Until real visual comparison is built, Vision alone drives the tier.
+    pattern_score = 40  # Neutral baseline — does not inflate or deflate
 
     # ── Combined Score ──
     combined_score = calculate_setup_score(vision_confidence, pattern_score)
 
-    logger.info(f"📊 {symbol}: Vision={vision_confidence:.0f} Pattern={pattern_score:.0f} "
+    logger.info(f"📊 {symbol}: Vision={vision_confidence:.0f} Pattern={pattern_score:.0f}(neutral) "
                 f"Combined={combined_score:.0f} (threshold: {SCORE_FORMING})")
 
     # ── Determine Tier ──
