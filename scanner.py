@@ -21,7 +21,10 @@ import math
 # v3.3.4 CHANGES:
 # 1. WASH TRADING FILTER — Detects uniform volume bars (bot activity)
 #    Uses coefficient of variation: CV < 0.5 = too uniform = likely scam
-#    Saves Vision calls by rejecting before chart analysis
+# 2. STAIRCASE FILTER — Detects bot pump patterns (uniform small green candles)
+#    CV < 0.6 on candle bodies + >75% green = likely bot, not real trading
+# 3. Volume bars REMOVED from alert charts — candles only, cleaner look
+#    Both scam filters save Vision calls by rejecting before chart analysis
 #
 # v3.3.3 FEATURES (preserved):
 # 1. DEX FILTER — Only pump.fun + PumpSwap tokens (no Meteora, Orca, Raydium)
@@ -173,6 +176,7 @@ def log_daily_summary():
     logger.info(f"   No impulse: {m['blocked_no_impulse']}")
     logger.info(f"   Choppy/invalid: {m['blocked_choppy']}")
     logger.info(f"   Wash trading: {m.get('blocked_wash_trading', 0)}")
+    logger.info(f"   Staircase pump: {m.get('blocked_staircase', 0)}")
     logger.info(f"   Low score: {m['blocked_low_score']}")
     logger.info(f"   Cooldown saved: {m['blocked_cooldown']}")
     logger.info(f"   Cooldown overrides: {m['cooldown_overrides']}")
@@ -955,6 +959,27 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes
                     logger.info(f"🚫 {symbol}: WASH TRADING detected — volume too uniform (CV={vol_cv:.2f}, needs >0.5)")
                     DAILY_METRICS['blocked_wash_trading'] = DAILY_METRICS.get('blocked_wash_trading', 0) + 1
                     return None
+
+        # ── STAIRCASE / BOT PUMP FILTER ──
+        # If candle bodies are all similar size and mostly green, stepping up uniformly
+        # it's likely a bot slowly pumping the price — not real organic trading
+        # Real charts have varied candle sizes with mix of green/red
+        if len(candles) >= 15:
+            bodies = [abs(c['c'] - c['o']) for c in candles if abs(c['c'] - c['o']) > 0]
+            greens = sum(1 for c in candles if c['c'] > c['o'])
+            green_pct = greens / len(candles)
+
+            if len(bodies) >= 10:
+                body_mean = sum(bodies) / len(bodies)
+                if body_mean > 0:
+                    body_std = (sum((b - body_mean) ** 2 for b in bodies) / len(bodies)) ** 0.5
+                    body_cv = body_std / body_mean
+
+                    # Staircase = uniform small bodies (CV < 0.6) AND mostly green (>75%)
+                    if body_cv < 0.6 and green_pct > 0.75:
+                        logger.info(f"🚫 {symbol}: STAIRCASE detected — uniform candles (CV={body_cv:.2f}) + {green_pct:.0%} green = likely bot pump")
+                        DAILY_METRICS['blocked_staircase'] = DAILY_METRICS.get('blocked_staircase', 0) + 1
+                        return None
 
         # --- PIL Candlestick Chart ---
         W, H = 1400, 700
@@ -1752,6 +1777,7 @@ async def main():
     logger.info(f"   DEX filter: {', '.join(ALLOWED_DEXES)} only")
     logger.info(f"   Profile required: YES (scam filter)")
     logger.info(f"   Wash trading filter: YES (uniform volume = bot activity)")
+    logger.info(f"   Staircase filter: YES (uniform candles + mostly green = bot pump)")
     logger.info(f"   Scoring: FORMING={SCORE_FORMING} VALID={SCORE_VALID} CONFIRMED={SCORE_CONFIRMED}")
     logger.info(f"   Weights: Vision={VISION_WEIGHT} Pattern={PATTERN_WEIGHT}")
     logger.info(f"   Dedup: F={DEDUP_FORMING_HOURS}h V={DEDUP_VALID_HOURS}h C={DEDUP_CONFIRMED_HOURS}h")
