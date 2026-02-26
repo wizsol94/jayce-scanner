@@ -23,8 +23,10 @@ import math
 #    Uses coefficient of variation: CV < 0.5 = too uniform = likely scam
 # 2. STAIRCASE FILTER — Detects bot pump patterns (uniform small green candles)
 #    CV < 0.6 on candle bodies + >75% green = likely bot, not real trading
-# 3. Volume bars REMOVED from alert charts — candles only, cleaner look
-#    Both scam filters save Vision calls by rejecting before chart analysis
+# 3. SPIKE+CHOP FILTER — Detects pump-and-distribute (one huge candle then tiny chop)
+#    Single candle >60% of total range + remaining candles <20% of spike = scam
+# 4. Volume bars REMOVED from alert charts — candles only, cleaner look
+#    All scam filters save Vision calls by rejecting before chart analysis
 #
 # v3.3.3 FEATURES (preserved):
 # 1. DEX FILTER — Only pump.fun + PumpSwap tokens (no Meteora, Orca, Raydium)
@@ -177,6 +179,7 @@ def log_daily_summary():
     logger.info(f"   Choppy/invalid: {m['blocked_choppy']}")
     logger.info(f"   Wash trading: {m.get('blocked_wash_trading', 0)}")
     logger.info(f"   Staircase pump: {m.get('blocked_staircase', 0)}")
+    logger.info(f"   Spike+chop: {m.get('blocked_spike_chop', 0)}")
     logger.info(f"   Low score: {m['blocked_low_score']}")
     logger.info(f"   Cooldown saved: {m['blocked_cooldown']}")
     logger.info(f"   Cooldown overrides: {m['cooldown_overrides']}")
@@ -981,6 +984,38 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes
                         DAILY_METRICS['blocked_staircase'] = DAILY_METRICS.get('blocked_staircase', 0) + 1
                         return None
 
+        # ── SPIKE AND CHOP FILTER ──
+        # If one or two candles account for most of the total price range,
+        # and everything after is tiny choppy candles, it's a pump-and-distribute
+        # Real setups have multiple candles building structure, not one spike then nothing
+        if len(candles) >= 10:
+            total_range = max(c['h'] for c in candles) - min(c['l'] for c in candles)
+            if total_range > 0:
+                # Find the single largest candle range
+                candle_ranges = [(c['h'] - c['l']) for c in candles]
+                max_candle_range = max(candle_ranges)
+                max_candle_idx = candle_ranges.index(max_candle_range)
+                
+                # Also check top 2 candles combined
+                sorted_ranges = sorted(candle_ranges, reverse=True)
+                top2_range = sorted_ranges[0] + sorted_ranges[1] if len(sorted_ranges) > 1 else sorted_ranges[0]
+                
+                single_pct = max_candle_range / total_range
+                top2_pct = top2_range / total_range
+                
+                # If single candle is >60% of total range, or top 2 are >75%
+                # AND the spike is in the first half of the chart (pump happened early)
+                # AND remaining candles are tiny (avg < 15% of spike candle)
+                if single_pct > 0.60 or top2_pct > 0.75:
+                    # Check if candles AFTER the spike are tiny (chop/distribution)
+                    remaining = candle_ranges[max_candle_idx + 1:] if max_candle_idx < len(candle_ranges) - 3 else []
+                    if len(remaining) >= 5:
+                        avg_remaining = sum(remaining) / len(remaining)
+                        if avg_remaining < max_candle_range * 0.20:
+                            logger.info(f"🚫 {symbol}: SPIKE+CHOP detected — single candle = {single_pct:.0%} of range, remaining avg = {avg_remaining/max_candle_range:.0%} of spike")
+                            DAILY_METRICS['blocked_spike_chop'] = DAILY_METRICS.get('blocked_spike_chop', 0) + 1
+                            return None
+
         # --- PIL Candlestick Chart ---
         W, H = 1400, 700
         CHART_TOP, CHART_BOT = 50, 640  # price area (full height, no volume)
@@ -1778,6 +1813,7 @@ async def main():
     logger.info(f"   Profile required: YES (scam filter)")
     logger.info(f"   Wash trading filter: YES (uniform volume = bot activity)")
     logger.info(f"   Staircase filter: YES (uniform candles + mostly green = bot pump)")
+    logger.info(f"   Spike+chop filter: YES (one candle = most of range + tiny after = pump & distribute)")
     logger.info(f"   Scoring: FORMING={SCORE_FORMING} VALID={SCORE_VALID} CONFIRMED={SCORE_CONFIRMED}")
     logger.info(f"   Weights: Vision={VISION_WEIGHT} Pattern={PATTERN_WEIGHT}")
     logger.info(f"   Dedup: F={DEDUP_FORMING_HOURS}h V={DEDUP_VALID_HOURS}h C={DEDUP_CONFIRMED_HOURS}h")
