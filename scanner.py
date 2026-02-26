@@ -15,14 +15,15 @@ from io import BytesIO
 import math
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JAYCE SCANNER v3.3.2 — SCORING + 5M + TIERED ALERTS + TELEGRAM COMMANDS
+# JAYCE SCANNER v3.3.3 — SCORING + 5M + TIERED ALERTS + TELEGRAM COMMANDS
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# v3.3.1 CHANGES:
-# 1. VISION REJECTION COOLDOWN — 45min cooldown after Vision rejects a token
-# 2. Cooldown overrides: h1 +10% jump, new impulse, 2x volume spike
-# 3. Saves ~50% of wasted Vision credits on re-scans
-# 4. NO changes to alert formatting, annotations, DB structure
+# v3.3.3 CHANGES:
+# 1. DEX FILTER — Only pump.fun + PumpSwap tokens (no Meteora, Orca, Raydium)
+# 2. PROFILE REQUIRED — Tokens without DexScreener profile are blocked (scam filter)
+# 3. PAIR SELECTION — Picks best pump.fun/PumpSwap pair by liquidity
+# 4. ALERT TRANSPARENCY — Contract address + DEX shown in every alert
+# 5. Early DEX filtering in all token sources (saves API calls)
 #
 # v3.3 FEATURES (preserved):
 # - FORCED 5M TIMEFRAME everywhere
@@ -619,10 +620,13 @@ def should_use_vision(token: dict) -> tuple:
     return (False, None, None)
 
 
+ALLOWED_DEXES = {'pumpfun', 'pumpswap'}  # Only pump.fun and PumpSwap tokens
+
 def pre_filter_token(token: dict) -> tuple:
     """
     Stage A pre-filter checks. Returns (passed, reason).
     v3.3: No dedup check here — dedup is now tier-aware and happens later.
+    v3.3.3: DEX filter (pump.fun/PumpSwap only) + profile required
     """
     mc = token.get('market_cap', 0)
     liq = token.get('liquidity', 0)
@@ -631,6 +635,16 @@ def pre_filter_token(token: dict) -> tuple:
         return (False, f"Market cap too low: ${mc:,.0f}")
     if liq < MIN_LIQUIDITY:
         return (False, f"Liquidity too low: ${liq:,.0f}")
+
+    # v3.3.3: DEX filter — only allow pump.fun and PumpSwap
+    dex = token.get('dex', '').lower()
+    if dex and dex not in ALLOWED_DEXES:
+        return (False, f"DEX filtered: {dex} (only pump.fun/PumpSwap)")
+
+    # v3.3.3: Profile required — no profile = likely scam
+    if token.get('has_profile') is False:
+        return (False, "No DexScreener profile (scam filter)")
+
     return (True, "Passed pre-filter")
 
 
@@ -738,6 +752,8 @@ async def fetch_top_movers() -> list:
                         count_before = len(tokens)
                         for pair in pairs[:40]:
                             if pair.get('chainId', '') != 'solana': continue
+                            # v3.3.3: Only pump.fun/PumpSwap pairs
+                            if pair.get('dexId', '').lower() not in ALLOWED_DEXES: continue
                             addr = pair.get('baseToken', {}).get('address', '')
                             if not addr or addr in seen: continue
 
@@ -784,6 +800,8 @@ async def fetch_top_movers() -> list:
                     for pair in pairs4_sorted[:30]:
                         addr = pair.get('baseToken', {}).get('address', '')
                         if not addr or addr in seen: continue
+                        # v3.3.3: Only pump.fun/PumpSwap pairs
+                        if pair.get('dexId', '').lower() not in ALLOWED_DEXES: continue
                         mc = float(pair.get('marketCap', 0) or pair.get('fdv', 0) or 0)
                         if mc < MIN_MARKET_CAP: continue
                         seen.add(addr)
@@ -813,7 +831,8 @@ async def fetch_top_movers() -> list:
 
 
 async def fetch_token_data(token_address: str) -> dict:
-    """Fetch detailed token data from DexScreener."""
+    """Fetch detailed token data from DexScreener.
+    v3.3.3: Only picks pump.fun/PumpSwap pairs. Checks for profile."""
     try:
         await asyncio.sleep(0.5)  # Rate limit: avoid 429s from DexScreener
         async with httpx.AsyncClient(timeout=15) as client:
@@ -825,24 +844,51 @@ async def fetch_token_data(token_address: str) -> dict:
             if resp.status_code == 200:
                 data = resp.json()
                 pairs = data.get('pairs', [])
-                if pairs:
-                    pair = pairs[0]
-                    pc = pair.get('priceChange', {})
-                    return {
-                        'address': token_address,
-                        'pair_address': pair.get('pairAddress', ''),
-                        'symbol': pair.get('baseToken', {}).get('symbol', '???'),
-                        'name': pair.get('baseToken', {}).get('name', 'Unknown'),
-                        'price_usd': float(pair.get('priceUsd', 0) or 0),
-                        'price_change_1h': float(pc.get('h1', 0) or 0),
-                        'price_change_6h': float(pc.get('h6', 0) or 0),
-                        'price_change_24h': float(pc.get('h24', 0) or 0),
-                        'market_cap': float(pair.get('marketCap', 0) or pair.get('fdv', 0) or 0),
-                        'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
-                        'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
-                        'txns_24h': pair.get('txns', {}).get('h24', {}).get('buys', 0) + pair.get('txns', {}).get('h24', {}).get('sells', 0),
-                        'dex': pair.get('dexId', 'unknown'),
-                    }
+                if not pairs:
+                    return {}
+
+                # v3.3.3: Find the best pump.fun or PumpSwap pair (highest liquidity)
+                allowed_pair = None
+                for p in pairs:
+                    dex = p.get('dexId', '').lower()
+                    if dex in ALLOWED_DEXES:
+                        if allowed_pair is None:
+                            allowed_pair = p
+                        else:
+                            # Pick the one with more liquidity
+                            p_liq = float(p.get('liquidity', {}).get('usd', 0) or 0)
+                            best_liq = float(allowed_pair.get('liquidity', {}).get('usd', 0) or 0)
+                            if p_liq > best_liq:
+                                allowed_pair = p
+
+                if not allowed_pair:
+                    # No pump.fun/PumpSwap pair found — skip this token
+                    logger.info(f"🚫 {token_address[:8]}...: No pump.fun/PumpSwap pair (dexes: {[p.get('dexId','?') for p in pairs[:3]]})")
+                    return {}
+
+                pair = allowed_pair
+                pc = pair.get('priceChange', {})
+
+                # v3.3.3: Check for DexScreener profile (info field)
+                info = pair.get('info', {})
+                has_profile = bool(info and (info.get('imageUrl') or info.get('websites') or info.get('socials')))
+
+                return {
+                    'address': token_address,
+                    'pair_address': pair.get('pairAddress', ''),
+                    'symbol': pair.get('baseToken', {}).get('symbol', '???'),
+                    'name': pair.get('baseToken', {}).get('name', 'Unknown'),
+                    'price_usd': float(pair.get('priceUsd', 0) or 0),
+                    'price_change_1h': float(pc.get('h1', 0) or 0),
+                    'price_change_6h': float(pc.get('h6', 0) or 0),
+                    'price_change_24h': float(pc.get('h24', 0) or 0),
+                    'market_cap': float(pair.get('marketCap', 0) or pair.get('fdv', 0) or 0),
+                    'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
+                    'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
+                    'txns_24h': pair.get('txns', {}).get('h24', {}).get('buys', 0) + pair.get('txns', {}).get('h24', {}).get('sells', 0),
+                    'dex': pair.get('dexId', 'unknown'),
+                    'has_profile': has_profile,
+                }
     except Exception as e:
         logger.error(f"❌ Token data fetch error for {token_address}: {e}")
     return {}
@@ -1323,7 +1369,14 @@ async def send_alert(token: dict, vision_result: dict, chart_bytes: bytes,
 {pattern_text}
 <b>Confidence:</b> {conf_text}"""
 
+        # v3.3.3: Add contract + DEX for transparency
+        dex_name = token.get('dex', 'unknown').upper()
+        short_addr = f"{address[:6]}...{address[-4:]}" if len(address) > 10 else address
+
         msg += f"""
+
+🔗 <b>CA:</b> <code>{address}</code>
+🏦 <b>DEX:</b> {dex_name}
 
 💡 <i>{reasoning}</i>"""
 
@@ -1389,6 +1442,9 @@ async def process_token(token: dict, browser_ctx) -> bool:
     # Step 1: Basic filters
     passed, reason = pre_filter_token(token)
     if not passed:
+        # v3.3.3: Log DEX and profile rejections for transparency
+        if 'DEX filtered' in reason or 'No DexScreener profile' in reason:
+            logger.info(f"🚫 {symbol}: {reason}")
         return False
 
     DAILY_METRICS['coins_passed_prefilter'] += 1
@@ -1677,9 +1733,11 @@ async def check_telegram_commands():
 async def main():
     """Main scanner loop with scoring system."""
     logger.info("═" * 60)
-    logger.info("🤖 JAYCE SCANNER v3.3.2 — SCORING + 5M + COMMANDS")
+    logger.info("🤖 JAYCE SCANNER v3.3.3 — PUMP.FUN/PUMPSWAP + PROFILE FILTER")
     logger.info(f"   Kill switch: {'🟢 ON' if ALERTS_ENABLED else '🔴 OFF'}")
     logger.info(f"   Timeframe: {CHART_TIMEFRAME}")
+    logger.info(f"   DEX filter: {', '.join(ALLOWED_DEXES)} only")
+    logger.info(f"   Profile required: YES (scam filter)")
     logger.info(f"   Scoring: FORMING={SCORE_FORMING} VALID={SCORE_VALID} CONFIRMED={SCORE_CONFIRMED}")
     logger.info(f"   Weights: Vision={VISION_WEIGHT} Pattern={PATTERN_WEIGHT}")
     logger.info(f"   Dedup: F={DEDUP_FORMING_HOURS}h V={DEDUP_VALID_HOURS}h C={DEDUP_CONFIRMED_HOURS}h")
