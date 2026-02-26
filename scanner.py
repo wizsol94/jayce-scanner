@@ -15,10 +15,15 @@ from io import BytesIO
 import math
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JAYCE SCANNER v3.3.3 — SCORING + 5M + TIERED ALERTS + TELEGRAM COMMANDS
+# JAYCE SCANNER v3.3.4 — SCORING + 5M + TIERED ALERTS + TELEGRAM COMMANDS
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# v3.3.3 CHANGES:
+# v3.3.4 CHANGES:
+# 1. WASH TRADING FILTER — Detects uniform volume bars (bot activity)
+#    Uses coefficient of variation: CV < 0.5 = too uniform = likely scam
+#    Saves Vision calls by rejecting before chart analysis
+#
+# v3.3.3 FEATURES (preserved):
 # 1. DEX FILTER — Only pump.fun + PumpSwap tokens (no Meteora, Orca, Raydium)
 # 2. PROFILE REQUIRED — Tokens without DexScreener profile are blocked (scam filter)
 # 3. PAIR SELECTION — Picks best pump.fun/PumpSwap pair by liquidity
@@ -167,6 +172,7 @@ def log_daily_summary():
     logger.info(f"   ─── Blocked ───")
     logger.info(f"   No impulse: {m['blocked_no_impulse']}")
     logger.info(f"   Choppy/invalid: {m['blocked_choppy']}")
+    logger.info(f"   Wash trading: {m.get('blocked_wash_trading', 0)}")
     logger.info(f"   Low score: {m['blocked_low_score']}")
     logger.info(f"   Cooldown saved: {m['blocked_cooldown']}")
     logger.info(f"   Cooldown overrides: {m['cooldown_overrides']}")
@@ -934,10 +940,26 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes
             })
         candles.sort(key=lambda x: x['ts'])
 
+        # ── WASH TRADING / SCAM FILTER ──
+        # If volume bars are suspiciously uniform, it's likely bot wash trading
+        # Real organic volume is spiky and irregular; bots produce even bars
+        vols = [c['v'] for c in candles if c['v'] > 0]
+        if len(vols) >= 10:
+            vol_mean = sum(vols) / len(vols)
+            if vol_mean > 0:
+                vol_std = (sum((v - vol_mean) ** 2 for v in vols) / len(vols)) ** 0.5
+                vol_cv = vol_std / vol_mean  # coefficient of variation
+                # CV < 0.5 means volume bars are very uniform (suspicious)
+                # Real organic trading typically has CV > 0.8-1.0+
+                if vol_cv < 0.5:
+                    logger.info(f"🚫 {symbol}: WASH TRADING detected — volume too uniform (CV={vol_cv:.2f}, needs >0.5)")
+                    DAILY_METRICS['blocked_wash_trading'] = DAILY_METRICS.get('blocked_wash_trading', 0) + 1
+                    return None
+
         # --- PIL Candlestick Chart ---
         W, H = 1400, 700
-        CHART_TOP, CHART_BOT = 50, 520  # price area
-        VOL_TOP, VOL_BOT = 540, 680     # volume area
+        CHART_TOP, CHART_BOT = 50, 640  # price area (full height, no volume)
+        VOL_BOT = 660                    # time label position
         LEFT, RIGHT = 60, 1340
         BG = (13, 17, 23)               # #0d1117
         GRID = (26, 31, 46)             # #1a1f2e
@@ -976,15 +998,11 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes
         if price_range == 0:
             price_range = price_max * 0.01 or 1e-12
 
-        # Volume range
+        # Volume range (kept for wash trading filter only, not drawn)
         all_vols = [c['v'] for c in candles]
-        vol_max = max(all_vols) if max(all_vols) > 0 else 1
 
         def price_y(p):
             return int(CHART_TOP + (1 - (p - price_min) / price_range) * (CHART_BOT - CHART_TOP))
-
-        def vol_y(v):
-            return int(VOL_BOT - (v / vol_max) * (VOL_BOT - VOL_TOP))
 
         # Grid lines (5 horizontal)
         for i in range(6):
@@ -1022,14 +1040,6 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes
             if y_bot - y_top < 1:
                 y_bot = y_top + 1
             draw.rectangle([(x_left, y_top), (x_right, y_bot)], fill=color)
-
-            # Volume bar
-            vy_top = vol_y(c['v'])
-            vol_color = (0, 200, 83, 128) if is_green else (255, 23, 68, 128)
-            draw.rectangle([(x_left, vy_top), (x_right, VOL_BOT)], fill=color)
-
-        # Volume separator line
-        draw.line([(LEFT, VOL_TOP - 5), (RIGHT, VOL_TOP - 5)], fill=GRID, width=1)
 
         # Time labels (show 5 evenly spaced)
         for i in range(5):
@@ -1741,6 +1751,7 @@ async def main():
     logger.info(f"   Timeframe: {CHART_TIMEFRAME}")
     logger.info(f"   DEX filter: {', '.join(ALLOWED_DEXES)} only")
     logger.info(f"   Profile required: YES (scam filter)")
+    logger.info(f"   Wash trading filter: YES (uniform volume = bot activity)")
     logger.info(f"   Scoring: FORMING={SCORE_FORMING} VALID={SCORE_VALID} CONFIRMED={SCORE_CONFIRMED}")
     logger.info(f"   Weights: Vision={VISION_WEIGHT} Pattern={PATTERN_WEIGHT}")
     logger.info(f"   Dedup: F={DEDUP_FORMING_HOURS}h V={DEDUP_VALID_HOURS}h C={DEDUP_CONFIRMED_HOURS}h")
