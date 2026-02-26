@@ -13,11 +13,6 @@ from playwright.async_api import async_playwright
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 import math
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import mplfinance as mpf
-import pandas as pd
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JAYCE SCANNER v3.3.2 — SCORING + 5M + TIERED ALERTS + TELEGRAM COMMANDS
@@ -858,13 +853,12 @@ async def fetch_token_data(token_address: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes:
-    """Render chart from OHLCV API data — no browser needed, bot-proof."""
+    """Render candlestick chart using PIL only — zero external deps needed."""
     if not pair_address:
         logger.warning(f"⚠️ No pair address for {symbol}")
         return None
 
     try:
-
         # Fetch OHLCV data from GeckoTerminal API (5m candles)
         api_url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pair_address}/ohlcv/minute?aggregate=5&limit=100"
         async with httpx.AsyncClient(timeout=15) as client:
@@ -881,42 +875,127 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes
             logger.warning(f"⚠️ {symbol}: Only {len(ohlcv_list) if ohlcv_list else 0} candles")
             return None
 
-        # Convert to DataFrame
-        rows = []
-        for candle in ohlcv_list:
-            ts = candle[0]
-            o, h, l, c, v = float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4]), float(candle[5])
-            rows.append({'Date': datetime.fromtimestamp(ts), 'Open': o, 'High': h, 'Low': l, 'Close': c, 'Volume': v})
+        # Parse candles and sort by time
+        candles = []
+        for c in ohlcv_list:
+            candles.append({
+                'ts': int(c[0]), 'o': float(c[1]), 'h': float(c[2]),
+                'l': float(c[3]), 'c': float(c[4]), 'v': float(c[5])
+            })
+        candles.sort(key=lambda x: x['ts'])
 
-        df = pd.DataFrame(rows)
-        df.set_index('Date', inplace=True)
-        df.sort_index(inplace=True)
+        # --- PIL Candlestick Chart ---
+        W, H = 1400, 700
+        CHART_TOP, CHART_BOT = 50, 520  # price area
+        VOL_TOP, VOL_BOT = 540, 680     # volume area
+        LEFT, RIGHT = 60, 1340
+        BG = (13, 17, 23)               # #0d1117
+        GRID = (26, 31, 46)             # #1a1f2e
+        GREEN = (0, 200, 83)            # #00c853
+        RED = (255, 23, 68)             # #ff1744
+        WHITE = (255, 255, 255)
+        GRAY = (128, 128, 128)
 
-        # Dark style similar to DexScreener/TradingView
-        mc = mpf.make_marketcolors(
-            up='#00c853', down='#ff1744', edge='inherit', wick='inherit',
-            volume={'up': '#00c85380', 'down': '#ff174480'}
-        )
-        style = mpf.make_mpf_style(
-            base_mpf_style='nightclouds', marketcolors=mc,
-            facecolor='#0d1117', edgecolor='#0d1117', figcolor='#0d1117',
-            gridcolor='#1a1f2e', gridstyle='--', y_on_right=True,
-        )
+        img = Image.new('RGB', (W, H), BG)
+        draw = ImageDraw.Draw(img)
 
-        # Render chart
+        # Try to load a font, fall back to default
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+            font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+            font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        except Exception:
+            font = ImageFont.load_default()
+            font_sm = font
+            font_title = font
+
+        # Title
+        draw.text((LEFT, 10), f"{symbol} · 5M", fill=WHITE, font=font_title)
+
+        n = len(candles)
+        chart_w = RIGHT - LEFT
+        candle_w = max(2, chart_w // n)
+        body_w = max(2, int(candle_w * 0.6))
+
+        # Price range
+        all_highs = [c['h'] for c in candles]
+        all_lows = [c['l'] for c in candles]
+        price_max = max(all_highs)
+        price_min = min(all_lows)
+        price_range = price_max - price_min
+        if price_range == 0:
+            price_range = price_max * 0.01 or 1e-12
+
+        # Volume range
+        all_vols = [c['v'] for c in candles]
+        vol_max = max(all_vols) if max(all_vols) > 0 else 1
+
+        def price_y(p):
+            return int(CHART_TOP + (1 - (p - price_min) / price_range) * (CHART_BOT - CHART_TOP))
+
+        def vol_y(v):
+            return int(VOL_BOT - (v / vol_max) * (VOL_BOT - VOL_TOP))
+
+        # Grid lines (5 horizontal)
+        for i in range(6):
+            y = CHART_TOP + i * (CHART_BOT - CHART_TOP) // 5
+            draw.line([(LEFT, y), (RIGHT, y)], fill=GRID, width=1)
+            p = price_max - (i / 5) * price_range
+            # Smart price formatting
+            if p >= 1:
+                label = f"{p:.4f}"
+            elif p >= 0.001:
+                label = f"{p:.6f}"
+            else:
+                label = f"{p:.10f}"
+            draw.text((RIGHT + 5, y - 6), label, fill=GRAY, font=font_sm)
+
+        # Draw candles
+        for i, c in enumerate(candles):
+            x_center = LEFT + int((i + 0.5) * chart_w / n)
+            x_left = x_center - body_w // 2
+            x_right = x_center + body_w // 2
+
+            is_green = c['c'] >= c['o']
+            color = GREEN if is_green else RED
+
+            # Wick
+            y_high = price_y(c['h'])
+            y_low = price_y(c['l'])
+            draw.line([(x_center, y_high), (x_center, y_low)], fill=color, width=1)
+
+            # Body
+            y_open = price_y(c['o'])
+            y_close = price_y(c['c'])
+            y_top = min(y_open, y_close)
+            y_bot = max(y_open, y_close)
+            if y_bot - y_top < 1:
+                y_bot = y_top + 1
+            draw.rectangle([(x_left, y_top), (x_right, y_bot)], fill=color)
+
+            # Volume bar
+            vy_top = vol_y(c['v'])
+            vol_color = (0, 200, 83, 128) if is_green else (255, 23, 68, 128)
+            draw.rectangle([(x_left, vy_top), (x_right, VOL_BOT)], fill=color)
+
+        # Volume separator line
+        draw.line([(LEFT, VOL_TOP - 5), (RIGHT, VOL_TOP - 5)], fill=GRID, width=1)
+
+        # Time labels (show 5 evenly spaced)
+        for i in range(5):
+            idx = int(i * (n - 1) / 4)
+            x = LEFT + int((idx + 0.5) * chart_w / n)
+            ts = candles[idx]['ts']
+            t_str = datetime.fromtimestamp(ts).strftime('%H:%M')
+            draw.text((x - 15, VOL_BOT + 5), t_str, fill=GRAY, font=font_sm)
+
+        # Save to bytes
         buf = BytesIO()
-        fig, axes = mpf.plot(
-            df, type='candle', style=style, volume=True,
-            figsize=(14, 7), returnfig=True, tight_layout=True,
-        )
-        axes[0].set_title(f'{symbol} · 5M', color='white', fontsize=14, fontweight='bold', loc='left')
-        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight',
-                    facecolor='#0d1117', edgecolor='none')
+        img.save(buf, format='PNG')
         buf.seek(0)
         chart_bytes = buf.read()
-        plt.close(fig)
 
-        logger.info(f"📸 API chart rendered for {symbol} ({len(chart_bytes)} bytes, {len(df)} candles)")
+        logger.info(f"📸 PIL chart rendered for {symbol} ({len(chart_bytes)} bytes, {n} candles)")
 
         # DEBUG: Send first 3 charts to Telegram
         if DAILY_METRICS.get('vision_calls', 0) < 3:
@@ -925,7 +1004,7 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> bytes
                 await debug_bot.send_photo(
                     chat_id=TELEGRAM_CHAT_ID,
                     photo=BytesIO(chart_bytes),
-                    caption=f"🔬 DEBUG: API chart for {symbol} (5M, {len(df)} candles)"
+                    caption=f"🔬 DEBUG: PIL chart for {symbol} (5M, {n} candles)"
                 )
                 logger.info(f"📤 Debug chart sent to Telegram for {symbol}")
             except Exception as de:
