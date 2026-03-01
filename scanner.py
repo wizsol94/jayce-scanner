@@ -458,170 +458,194 @@ def hard_block_check(token: dict, vision_result: dict) -> tuple:
 
 async def fetch_top_movers() -> list:
     """
-    Scan like Wiz does:
-    1. Top 100 gainers
-    2. 5M volume leaders
-    3. 1H volume leaders
-    Rotate through all day
+    Scrape DexScreener EXACTLY how Wiz trades:
+    1. Load page with filters
+    2. Scrape default list (Trending H6 = Top 100)
+    3. Click 5M button → scrape that list
+    4. Click 1H button → scrape that list
+    5. Combine all unique coins
     """
+    tokens, seen = [], set()
+    
+    DEXSCREENER_URL = "https://dexscreener.com/?rankBy=trendingScoreH6&order=desc&chainIds=solana&dexIds=pumpswap,pumpfun&minLiq=10000&minMarketCap=100000&launchpads=1"
+    
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+            page = await browser.new_page(viewport={'width': 1400, 'height': 900})
+            
+            # ══════════════════════════════════════════════════════════════
+            # 1. LOAD PAGE WITH YOUR FILTERS
+            # ══════════════════════════════════════════════════════════════
+            logger.info("🌐 Loading DexScreener with your filters...")
+            await page.goto(DEXSCREENER_URL, wait_until='networkidle', timeout=30000)
+            await asyncio.sleep(3)  # Let JavaScript render
+            
+            # ══════════════════════════════════════════════════════════════
+            # 2. SCRAPE TOP 100 (Default Trending H6)
+            # ══════════════════════════════════════════════════════════════
+            logger.info("📈 Scraping TOP 100 (Trending H6)...")
+            top100_tokens = await scrape_token_list(page, seen, 'TOP_100')
+            tokens.extend(top100_tokens)
+            logger.info(f"   Found {len(top100_tokens)} tokens")
+            
+            # ══════════════════════════════════════════════════════════════
+            # 3. CLICK 5M BUTTON AND SCRAPE
+            # ══════════════════════════════════════════════════════════════
+            logger.info("⏱️ Clicking 5M and scraping...")
+            try:
+                # Look for 5M button/tab
+                five_m_btn = await page.query_selector('button:has-text("5m"), [data-timeframe="5m"], .timeframe-5m')
+                if five_m_btn:
+                    await five_m_btn.click()
+                    await asyncio.sleep(2)
+                    five_m_tokens = await scrape_token_list(page, seen, '5M_VOL')
+                    tokens.extend(five_m_tokens)
+                    logger.info(f"   Found {len(five_m_tokens)} tokens")
+                else:
+                    # Try clicking by text content
+                    await page.click('text="5m"', timeout=5000)
+                    await asyncio.sleep(2)
+                    five_m_tokens = await scrape_token_list(page, seen, '5M_VOL')
+                    tokens.extend(five_m_tokens)
+                    logger.info(f"   Found {len(five_m_tokens)} tokens")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not click 5M: {e}")
+            
+            # ══════════════════════════════════════════════════════════════
+            # 4. CLICK 1H BUTTON AND SCRAPE
+            # ══════════════════════════════════════════════════════════════
+            logger.info("⏰ Clicking 1H and scraping...")
+            try:
+                # Look for 1H button/tab
+                one_h_btn = await page.query_selector('button:has-text("1h"), [data-timeframe="1h"], .timeframe-1h')
+                if one_h_btn:
+                    await one_h_btn.click()
+                    await asyncio.sleep(2)
+                    one_h_tokens = await scrape_token_list(page, seen, '1H_VOL')
+                    tokens.extend(one_h_tokens)
+                    logger.info(f"   Found {len(one_h_tokens)} tokens")
+                else:
+                    # Try clicking by text content
+                    await page.click('text="1h"', timeout=5000)
+                    await asyncio.sleep(2)
+                    one_h_tokens = await scrape_token_list(page, seen, '1H_VOL')
+                    tokens.extend(one_h_tokens)
+                    logger.info(f"   Found {len(one_h_tokens)} tokens")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not click 1H: {e}")
+            
+            await browser.close()
+            
+    except Exception as e:
+        logger.error(f"❌ DexScreener scrape error: {e}")
+        # Fallback to API if scraping fails
+        logger.info("🔄 Falling back to API...")
+        return await fetch_top_movers_api_fallback()
+    
+    logger.info(f"═══════════════════════════════════════════════")
+    logger.info(f"📊 Total unique tokens to scan: {len(tokens)}")
+    logger.info(f"   TOP_100: {len([t for t in tokens if t.get('source') == 'TOP_100'])}")
+    logger.info(f"   5M_VOL: {len([t for t in tokens if t.get('source') == '5M_VOL'])}")
+    logger.info(f"   1H_VOL: {len([t for t in tokens if t.get('source') == '1H_VOL'])}")
+    logger.info(f"═══════════════════════════════════════════════")
+    
+    return tokens
+
+
+async def scrape_token_list(page, seen: set, source: str) -> list:
+    """Scrape token list from current DexScreener page state"""
+    tokens = []
+    
+    try:
+        # Get all token rows - DexScreener uses links with /solana/ in the href
+        rows = await page.query_selector_all('a[href*="/solana/"]')
+        
+        for row in rows[:100]:  # Limit to top 100
+            try:
+                href = await row.get_attribute('href')
+                if not href or '/solana/' not in href:
+                    continue
+                
+                # Extract pair address from href (format: /solana/PAIR_ADDRESS)
+                pair_address = href.split('/solana/')[-1].split('?')[0].split('/')[0]
+                if not pair_address or len(pair_address) < 30:
+                    continue
+                
+                if pair_address in seen:
+                    continue
+                
+                # Try to get token symbol from the row
+                text_content = await row.text_content()
+                symbol = '???'
+                if text_content:
+                    # First word is usually the symbol
+                    parts = text_content.strip().split()
+                    if parts:
+                        symbol = parts[0][:20]  # Limit length
+                
+                seen.add(pair_address)
+                tokens.append({
+                    'address': '',  # Will be fetched later
+                    'pair_address': pair_address,
+                    'symbol': symbol,
+                    'source': source
+                })
+                logger.info(f"   👀 {symbol} ({source})")
+                
+            except Exception as e:
+                continue
+                
+    except Exception as e:
+        logger.error(f"❌ Scrape error: {e}")
+    
+    return tokens
+
+
+async def fetch_top_movers_api_fallback() -> list:
+    """Fallback to API if scraping fails"""
     tokens, seen = [], set()
     
     try:
         async with httpx.AsyncClient(timeout=20) as client:
+            # Use the search endpoints as backup
+            logger.info("📈 API Fallback: Fetching from DexScreener API...")
             
-            # ══════════════════════════════════════════════════════════════
-            # 1. TOP GAINERS (1H, 6H, 24H) — Like clicking "Top" on DexScreener
-            # ══════════════════════════════════════════════════════════════
-            logger.info("📈 Scanning TOP GAINERS...")
-            try:
-                # Get top gainers via token boosts + ranking
-                resp = await client.get('https://api.dexscreener.com/token-boosts/top/v1')
-                if resp.status_code == 200:
-                    data = resp.json()
-                    items = data if isinstance(data, list) else data.get('tokens', [])
-                    for item in items[:50]:
-                        addr = item.get('tokenAddress', '')
-                        if addr and addr not in seen and item.get('chainId', 'solana') == 'solana':
+            for query in ['pumpfun', 'pumpswap']:
+                try:
+                    resp = await client.get(f'https://api.dexscreener.com/latest/dex/search?q={query}')
+                    if resp.status_code == 200:
+                        for pair in resp.json().get('pairs', [])[:50]:
+                            if pair.get('chainId') != 'solana': continue
+                            if pair.get('dexId', '').lower() not in ALLOWED_DEXES: continue
+                            addr = pair.get('baseToken', {}).get('address', '')
+                            if not addr or addr in seen: continue
+                            mc = float(pair.get('marketCap', 0) or 0)
+                            if mc < MIN_MARKET_CAP: continue
+                            liq = float(pair.get('liquidity', {}).get('usd', 0) or 0)
+                            if liq < MIN_LIQUIDITY: continue
                             seen.add(addr)
+                            symbol = pair.get('baseToken', {}).get('symbol', '???')
                             tokens.append({
                                 'address': addr, 
-                                'symbol': item.get('symbol', '???'), 
-                                'pair_address': item.get('pairAddress', ''), 
-                                'source': 'TOP_GAINERS'
+                                'pair_address': pair.get('pairAddress', ''),
+                                'symbol': symbol, 
+                                'source': 'API_FALLBACK',
+                                'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
+                                'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
+                                'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
+                                'market_cap': mc,
+                                'liquidity': liq,
+                                'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
                             })
-                            logger.info(f"   👀 {item.get('symbol', '???')} (TOP)")
-            except Exception as e:
-                logger.error(f"❌ Top gainers error: {e}")
-            
-            # ══════════════════════════════════════════════════════════════
-            # 2. SOLANA TRENDING/VOLUME — General high activity
-            # ══════════════════════════════════════════════════════════════
-            logger.info("🔥 Scanning TRENDING SOLANA...")
-            try:
-                resp = await client.get('https://api.dexscreener.com/latest/dex/search?q=sol')
-                if resp.status_code == 200:
-                    for pair in resp.json().get('pairs', [])[:50]:
-                        if pair.get('chainId') != 'solana': continue
-                        if pair.get('dexId', '').lower() not in ALLOWED_DEXES: continue
-                        addr = pair.get('baseToken', {}).get('address', '')
-                        if not addr or addr in seen: continue
-                        mc = float(pair.get('marketCap', 0) or 0)
-                        if mc < MIN_MARKET_CAP: continue
-                        seen.add(addr)
-                        symbol = pair.get('baseToken', {}).get('symbol', '???')
-                        tokens.append({
-                            'address': addr, 'pair_address': pair.get('pairAddress', ''),
-                            'symbol': symbol, 'source': 'TRENDING',
-                            'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
-                            'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
-                            'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
-                            'market_cap': mc, 
-                            'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
-                            'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
-                        })
-                        logger.info(f"   👀 {symbol} (TRENDING)")
-            except Exception as e:
-                logger.error(f"❌ Trending error: {e}")
-            
-            # ══════════════════════════════════════════════════════════════
-            # 3. 5M VOLUME LEADERS — Like clicking "5M" volume sort
-            # ══════════════════════════════════════════════════════════════
-            logger.info("⏱️ Scanning 5M VOLUME...")
-            try:
-                resp = await client.get('https://api.dexscreener.com/latest/dex/search?q=pumpfun')
-                if resp.status_code == 200:
-                    pairs = resp.json().get('pairs', [])
-                    # Sort by 5m volume (h24 volume / 288 as proxy, or just take top)
-                    for pair in pairs[:40]:
-                        if pair.get('chainId') != 'solana': continue
-                        if pair.get('dexId', '').lower() not in ALLOWED_DEXES: continue
-                        addr = pair.get('baseToken', {}).get('address', '')
-                        if not addr or addr in seen: continue
-                        mc = float(pair.get('marketCap', 0) or 0)
-                        if mc < MIN_MARKET_CAP: continue
-                        seen.add(addr)
-                        symbol = pair.get('baseToken', {}).get('symbol', '???')
-                        tokens.append({
-                            'address': addr, 'pair_address': pair.get('pairAddress', ''),
-                            'symbol': symbol, 'source': '5M_VOLUME',
-                            'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
-                            'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
-                            'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
-                            'market_cap': mc,
-                            'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
-                            'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
-                        })
-                        logger.info(f"   👀 {symbol} (5M VOL)")
-            except Exception as e:
-                logger.error(f"❌ 5M volume error: {e}")
-            
-            # ══════════════════════════════════════════════════════════════
-            # 4. 1H VOLUME LEADERS — Like clicking "1H" volume sort
-            # ══════════════════════════════════════════════════════════════
-            logger.info("⏰ Scanning 1H VOLUME...")
-            try:
-                resp = await client.get('https://api.dexscreener.com/latest/dex/search?q=pumpswap')
-                if resp.status_code == 200:
-                    pairs = resp.json().get('pairs', [])
-                    for pair in pairs[:40]:
-                        if pair.get('chainId') != 'solana': continue
-                        if pair.get('dexId', '').lower() not in ALLOWED_DEXES: continue
-                        addr = pair.get('baseToken', {}).get('address', '')
-                        if not addr or addr in seen: continue
-                        mc = float(pair.get('marketCap', 0) or 0)
-                        if mc < MIN_MARKET_CAP: continue
-                        seen.add(addr)
-                        symbol = pair.get('baseToken', {}).get('symbol', '???')
-                        tokens.append({
-                            'address': addr, 'pair_address': pair.get('pairAddress', ''),
-                            'symbol': symbol, 'source': '1H_VOLUME',
-                            'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
-                            'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
-                            'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
-                            'market_cap': mc,
-                            'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
-                            'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
-                        })
-                        logger.info(f"   👀 {symbol} (1H VOL)")
-            except Exception as e:
-                logger.error(f"❌ 1H volume error: {e}")
-            
-            # ══════════════════════════════════════════════════════════════
-            # 5. NEW PAIRS — Catch fresh launches
-            # ══════════════════════════════════════════════════════════════
-            logger.info("🆕 Scanning NEW PAIRS...")
-            try:
-                resp = await client.get('https://api.dexscreener.com/token-profiles/latest/v1')
-                if resp.status_code == 200:
-                    data = resp.json()
-                    items = data if isinstance(data, list) else []
-                    for item in items[:30]:
-                        if item.get('chainId') != 'solana': continue
-                        addr = item.get('tokenAddress', '')
-                        if addr and addr not in seen:
-                            seen.add(addr)
-                            tokens.append({
-                                'address': addr,
-                                'symbol': item.get('symbol', '???'),
-                                'pair_address': '',
-                                'source': 'NEW_PAIRS'
-                            })
-                            logger.info(f"   👀 {item.get('symbol', '???')} (NEW)")
-            except Exception as e:
-                logger.error(f"❌ New pairs error: {e}")
-                
+                            logger.info(f"   👀 {symbol} (API)")
+                except Exception as e:
+                    logger.error(f"❌ API fallback error: {e}")
+                    
     except Exception as e:
         logger.error(f"❌ API error: {e}")
     
-    logger.info(f"═══════════════════════════════════════════════")
-    logger.info(f"📊 Total unique tokens to scan: {len(tokens)}")
-    logger.info(f"   TOP_GAINERS: {len([t for t in tokens if t.get('source') == 'TOP_GAINERS'])}")
-    logger.info(f"   TRENDING: {len([t for t in tokens if t.get('source') == 'TRENDING'])}")
-    logger.info(f"   5M_VOLUME: {len([t for t in tokens if t.get('source') == '5M_VOLUME'])}")
-    logger.info(f"   1H_VOLUME: {len([t for t in tokens if t.get('source') == '1H_VOLUME'])}")
-    logger.info(f"   NEW_PAIRS: {len([t for t in tokens if t.get('source') == 'NEW_PAIRS'])}")
-    logger.info(f"═══════════════════════════════════════════════")
-    
+    logger.info(f"📊 API Fallback fetched {len(tokens)} tokens")
     return tokens
 
 async def fetch_token_data(token_address: str) -> dict:
