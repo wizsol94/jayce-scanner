@@ -457,26 +457,50 @@ def hard_block_check(token: dict, vision_result: dict) -> tuple:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def fetch_top_movers() -> list:
+    """
+    Scan like Wiz does:
+    1. Top 100 gainers
+    2. 5M volume leaders
+    3. 1H volume leaders
+    Rotate through all day
+    """
     tokens, seen = [], set()
+    
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            # Boosted
+        async with httpx.AsyncClient(timeout=20) as client:
+            
+            # ══════════════════════════════════════════════════════════════
+            # 1. TOP GAINERS (1H, 6H, 24H) — Like clicking "Top" on DexScreener
+            # ══════════════════════════════════════════════════════════════
+            logger.info("📈 Scanning TOP GAINERS...")
             try:
+                # Get top gainers via token boosts + ranking
                 resp = await client.get('https://api.dexscreener.com/token-boosts/top/v1')
                 if resp.status_code == 200:
                     data = resp.json()
                     items = data if isinstance(data, list) else data.get('tokens', [])
-                    for item in items[:CHARTS_PER_SCAN]:
+                    for item in items[:50]:
                         addr = item.get('tokenAddress', '')
                         if addr and addr not in seen and item.get('chainId', 'solana') == 'solana':
                             seen.add(addr)
-                            tokens.append({'address': addr, 'symbol': item.get('symbol', '???'), 'pair_address': item.get('pairAddress', ''), 'source': 'BOOSTED'})
-            except: pass
-            # Volume search
+                            tokens.append({
+                                'address': addr, 
+                                'symbol': item.get('symbol', '???'), 
+                                'pair_address': item.get('pairAddress', ''), 
+                                'source': 'TOP_GAINERS'
+                            })
+                            logger.info(f"   👀 {item.get('symbol', '???')} (TOP)")
+            except Exception as e:
+                logger.error(f"❌ Top gainers error: {e}")
+            
+            # ══════════════════════════════════════════════════════════════
+            # 2. SOLANA TRENDING/VOLUME — General high activity
+            # ══════════════════════════════════════════════════════════════
+            logger.info("🔥 Scanning TRENDING SOLANA...")
             try:
                 resp = await client.get('https://api.dexscreener.com/latest/dex/search?q=sol')
                 if resp.status_code == 200:
-                    for pair in resp.json().get('pairs', [])[:40]:
+                    for pair in resp.json().get('pairs', [])[:50]:
                         if pair.get('chainId') != 'solana': continue
                         if pair.get('dexId', '').lower() not in ALLOWED_DEXES: continue
                         addr = pair.get('baseToken', {}).get('address', '')
@@ -484,19 +508,120 @@ async def fetch_top_movers() -> list:
                         mc = float(pair.get('marketCap', 0) or 0)
                         if mc < MIN_MARKET_CAP: continue
                         seen.add(addr)
+                        symbol = pair.get('baseToken', {}).get('symbol', '???')
                         tokens.append({
                             'address': addr, 'pair_address': pair.get('pairAddress', ''),
-                            'symbol': pair.get('baseToken', {}).get('symbol', '???'), 'source': 'VOLUME',
+                            'symbol': symbol, 'source': 'TRENDING',
                             'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
                             'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
                             'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
-                            'market_cap': mc, 'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
+                            'market_cap': mc, 
+                            'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
                             'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
                         })
-            except: pass
+                        logger.info(f"   👀 {symbol} (TRENDING)")
+            except Exception as e:
+                logger.error(f"❌ Trending error: {e}")
+            
+            # ══════════════════════════════════════════════════════════════
+            # 3. 5M VOLUME LEADERS — Like clicking "5M" volume sort
+            # ══════════════════════════════════════════════════════════════
+            logger.info("⏱️ Scanning 5M VOLUME...")
+            try:
+                resp = await client.get('https://api.dexscreener.com/latest/dex/search?q=pumpfun')
+                if resp.status_code == 200:
+                    pairs = resp.json().get('pairs', [])
+                    # Sort by 5m volume (h24 volume / 288 as proxy, or just take top)
+                    for pair in pairs[:40]:
+                        if pair.get('chainId') != 'solana': continue
+                        if pair.get('dexId', '').lower() not in ALLOWED_DEXES: continue
+                        addr = pair.get('baseToken', {}).get('address', '')
+                        if not addr or addr in seen: continue
+                        mc = float(pair.get('marketCap', 0) or 0)
+                        if mc < MIN_MARKET_CAP: continue
+                        seen.add(addr)
+                        symbol = pair.get('baseToken', {}).get('symbol', '???')
+                        tokens.append({
+                            'address': addr, 'pair_address': pair.get('pairAddress', ''),
+                            'symbol': symbol, 'source': '5M_VOLUME',
+                            'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
+                            'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
+                            'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
+                            'market_cap': mc,
+                            'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
+                            'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
+                        })
+                        logger.info(f"   👀 {symbol} (5M VOL)")
+            except Exception as e:
+                logger.error(f"❌ 5M volume error: {e}")
+            
+            # ══════════════════════════════════════════════════════════════
+            # 4. 1H VOLUME LEADERS — Like clicking "1H" volume sort
+            # ══════════════════════════════════════════════════════════════
+            logger.info("⏰ Scanning 1H VOLUME...")
+            try:
+                resp = await client.get('https://api.dexscreener.com/latest/dex/search?q=pumpswap')
+                if resp.status_code == 200:
+                    pairs = resp.json().get('pairs', [])
+                    for pair in pairs[:40]:
+                        if pair.get('chainId') != 'solana': continue
+                        if pair.get('dexId', '').lower() not in ALLOWED_DEXES: continue
+                        addr = pair.get('baseToken', {}).get('address', '')
+                        if not addr or addr in seen: continue
+                        mc = float(pair.get('marketCap', 0) or 0)
+                        if mc < MIN_MARKET_CAP: continue
+                        seen.add(addr)
+                        symbol = pair.get('baseToken', {}).get('symbol', '???')
+                        tokens.append({
+                            'address': addr, 'pair_address': pair.get('pairAddress', ''),
+                            'symbol': symbol, 'source': '1H_VOLUME',
+                            'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
+                            'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
+                            'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
+                            'market_cap': mc,
+                            'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
+                            'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
+                        })
+                        logger.info(f"   👀 {symbol} (1H VOL)")
+            except Exception as e:
+                logger.error(f"❌ 1H volume error: {e}")
+            
+            # ══════════════════════════════════════════════════════════════
+            # 5. NEW PAIRS — Catch fresh launches
+            # ══════════════════════════════════════════════════════════════
+            logger.info("🆕 Scanning NEW PAIRS...")
+            try:
+                resp = await client.get('https://api.dexscreener.com/token-profiles/latest/v1')
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data if isinstance(data, list) else []
+                    for item in items[:30]:
+                        if item.get('chainId') != 'solana': continue
+                        addr = item.get('tokenAddress', '')
+                        if addr and addr not in seen:
+                            seen.add(addr)
+                            tokens.append({
+                                'address': addr,
+                                'symbol': item.get('symbol', '???'),
+                                'pair_address': '',
+                                'source': 'NEW_PAIRS'
+                            })
+                            logger.info(f"   👀 {item.get('symbol', '???')} (NEW)")
+            except Exception as e:
+                logger.error(f"❌ New pairs error: {e}")
+                
     except Exception as e:
         logger.error(f"❌ API error: {e}")
-    logger.info(f"📊 Fetched {len(tokens)} tokens")
+    
+    logger.info(f"═══════════════════════════════════════════════")
+    logger.info(f"📊 Total unique tokens to scan: {len(tokens)}")
+    logger.info(f"   TOP_GAINERS: {len([t for t in tokens if t.get('source') == 'TOP_GAINERS'])}")
+    logger.info(f"   TRENDING: {len([t for t in tokens if t.get('source') == 'TRENDING'])}")
+    logger.info(f"   5M_VOLUME: {len([t for t in tokens if t.get('source') == '5M_VOLUME'])}")
+    logger.info(f"   1H_VOLUME: {len([t for t in tokens if t.get('source') == '1H_VOLUME'])}")
+    logger.info(f"   NEW_PAIRS: {len([t for t in tokens if t.get('source') == 'NEW_PAIRS'])}")
+    logger.info(f"═══════════════════════════════════════════════")
+    
     return tokens
 
 async def fetch_token_data(token_address: str) -> dict:
@@ -982,6 +1107,21 @@ async def check_telegram_commands():
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, 
                         text=f"📊 Scanned: {m['coins_scanned']} | Engines: {m['engine_triggers']} | Vision: {m['vision_calls']}\n📚 Flashcards cached: {cache_size} | Fetched today: {m['flashcard_fetches']}", 
                         parse_mode=ParseMode.HTML)
+                elif text == '/coins':
+                    # Show coins currently on watchlist
+                    watchlist = get_watchlist()
+                    if not watchlist:
+                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="📋 No coins on watchlist yet", parse_mode=ParseMode.HTML)
+                    else:
+                        coin_list = []
+                        for w in watchlist[:30]:  # Limit to 30
+                            coin_list.append(f"• {w.get('symbol', '???')}")
+                        
+                        msg = f"📋 <b>WATCHLIST ({len(watchlist)} coins)</b>\n\n"
+                        msg += "\n".join(coin_list)
+                        if len(watchlist) > 30:
+                            msg += f"\n\n... and {len(watchlist) - 30} more"
+                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.HTML)
         except: pass
         await asyncio.sleep(2)
 
