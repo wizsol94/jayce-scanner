@@ -39,6 +39,8 @@ JAYCE_BOT_TOKEN = os.getenv('JAYCE_BOT_TOKEN', '8235602450:AAG9g__NmneEhBTTwcJgi
 CHARTS_PER_SCAN = int(os.getenv('CHARTS_PER_SCAN', 70))
 MIN_MARKET_CAP = int(os.getenv('MIN_MARKET_CAP', 100000))
 MIN_LIQUIDITY = int(os.getenv('MIN_LIQUIDITY', 10000))
+MIN_COIN_AGE_HOURS = float(os.getenv('MIN_COIN_AGE_HOURS', 3))  # Minimum 3 hours old
+MIN_CANDLES = int(os.getenv('MIN_CANDLES', 36))  # 36 candles = 3 hours on 5M chart
 IMPULSE_H24_THRESHOLD = float(os.getenv('IMPULSE_H24_THRESHOLD', 40))
 IMPULSE_H6_THRESHOLD = float(os.getenv('IMPULSE_H6_THRESHOLD', 25))
 IMPULSE_H1_THRESHOLD = float(os.getenv('IMPULSE_H1_THRESHOLD', 15))
@@ -96,6 +98,7 @@ DAILY_METRICS = {
     'blocked_no_impulse': 0, 'blocked_choppy': 0, 'blocked_low_score': 0,
     'blocked_cooldown': 0, 'cooldown_overrides': 0,
     'blocked_wash_trading': 0, 'blocked_staircase': 0, 'blocked_spike_chop': 0,
+    'blocked_too_new': 0, 'blocked_low_candles': 0,  # v4.2: Age/candle filters
     'flashcard_fetches': 0,  # v4.1: Track flashcard usage
 }
 
@@ -803,6 +806,14 @@ async def fetch_token_data(token_address: str) -> dict:
                 if not pair: return {}
                 pc = pair.get('priceChange', {})
                 info = pair.get('info', {})
+                
+                # Calculate coin age in hours
+                pair_created = pair.get('pairCreatedAt', 0)
+                if pair_created:
+                    age_hours = (datetime.now().timestamp() * 1000 - pair_created) / (1000 * 60 * 60)
+                else:
+                    age_hours = 999  # Unknown age, allow it
+                
                 return {
                     'address': token_address, 'pair_address': pair.get('pairAddress', ''),
                     'symbol': pair.get('baseToken', {}).get('symbol', '???'),
@@ -814,6 +825,8 @@ async def fetch_token_data(token_address: str) -> dict:
                     'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
                     'dex': pair.get('dexId', ''),
                     'has_profile': bool(info.get('imageUrl')) and len(info.get('socials', []) + info.get('websites', [])) >= 1,
+                    'age_hours': age_hours,
+                    'pair_created_at': pair_created,
                 }
     except: pass
     return {}
@@ -1108,6 +1121,14 @@ async def process_token(token: dict, browser_ctx) -> bool:
     address = token.get('address', '')
     DAILY_METRICS['coins_scanned'] += 1
     
+    # ══════════════════════════════════════════════════════════════
+    # COIN AGE FILTER — Skip baby charts (less than 3 hours old)
+    # ══════════════════════════════════════════════════════════════
+    age_hours = token.get('age_hours', 999)
+    if age_hours < MIN_COIN_AGE_HOURS:
+        logger.info(f"⏳ {symbol}: Too new ({age_hours:.1f}h < {MIN_COIN_AGE_HOURS}h) — SKIPPED")
+        return False
+    
     # Pre-filter
     passed, reason = pre_filter_token(token)
     if not passed: return False
@@ -1131,6 +1152,13 @@ async def process_token(token: dict, browser_ctx) -> bool:
     
     chart_bytes, candles = await screenshot_chart(pair_address, symbol, browser_ctx)
     if not chart_bytes: return False
+    
+    # ══════════════════════════════════════════════════════════════
+    # CANDLE COUNT FILTER — Need enough chart development
+    # ══════════════════════════════════════════════════════════════
+    if candles and len(candles) < MIN_CANDLES:
+        logger.info(f"📊 {symbol}: Not enough candles ({len(candles)} < {MIN_CANDLES}) — SKIPPED")
+        return False
     
     # v4.1: Run WizTheory engine detection
     engine_result = None
