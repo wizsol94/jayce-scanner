@@ -13,12 +13,13 @@ from playwright.async_api import async_playwright
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 import math
+import random
 
-# v4.0: Import WizTheory detection engines
+# v4.1: Import WizTheory detection engines
 from engines import run_detection, format_engine_result_text, cleanup_engine_cooldowns
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JAYCE SCANNER v4.0 — WIZTHEORY ENGINES + VISION + TIERED ALERTS
+# JAYCE SCANNER v4.1 — WIZTHEORY ENGINES + FLASHCARD TRAINING + VISION
 # ══════════════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -31,6 +32,9 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
+
+# v4.1: Jayce Bot token for accessing flashcard images
+JAYCE_BOT_TOKEN = os.getenv('JAYCE_BOT_TOKEN', '8235602450:AAG9g__NmneEhBTTwcJgiQpqOwZere6FQc0')
 
 CHARTS_PER_SCAN = int(os.getenv('CHARTS_PER_SCAN', 70))
 MIN_MARKET_CAP = int(os.getenv('MIN_MARKET_CAP', 100000))
@@ -70,6 +74,10 @@ GITHUB_REPO = os.getenv('GITHUB_REPO', 'wizsol94/jayce-bot')
 GITHUB_BACKUP_PATH = os.getenv('GITHUB_BACKUP_PATH', 'backups/jayce_training_dataset.json')
 TRAINING_REFRESH_HOURS = int(os.getenv('TRAINING_REFRESH_HOURS', 6))
 
+# v4.1: Flashcard training settings
+FLASHCARD_EXAMPLES_PER_SETUP = int(os.getenv('FLASHCARD_EXAMPLES_PER_SETUP', 3))
+FLASHCARD_CACHE_HOURS = int(os.getenv('FLASHCARD_CACHE_HOURS', 24))
+
 TRAINED_SETUPS = {
     '382 + Flip Zone': {'count': 40, 'avg_outcome': 85},
     '50 + Flip Zone': {'count': 45, 'avg_outcome': 92},
@@ -88,11 +96,16 @@ DAILY_METRICS = {
     'blocked_no_impulse': 0, 'blocked_choppy': 0, 'blocked_low_score': 0,
     'blocked_cooldown': 0, 'cooldown_overrides': 0,
     'blocked_wash_trading': 0, 'blocked_staircase': 0, 'blocked_spike_chop': 0,
+    'flashcard_fetches': 0,  # v4.1: Track flashcard usage
 }
 
 VISION_COOLDOWN_CACHE = {}
 TRAINING_DATA = []
 TRAINING_LAST_LOADED = None
+
+# v4.1: Cache for downloaded flashcard images (to avoid re-downloading)
+FLASHCARD_IMAGE_CACHE = {}
+FLASHCARD_CACHE_TIMESTAMP = None
 
 CHOPPY_KEYWORDS = ['choppy', 'no structure', 'no setup', 'messy', 'sideways', 
                    'range-bound', 'no clear', 'unclear', 'weak structure', 'no impulse visible']
@@ -111,7 +124,7 @@ def reset_metrics_if_new_day():
 def log_current_metrics():
     m = DAILY_METRICS
     total = m['forming_alerts'] + m['valid_alerts'] + m['confirmed_alerts']
-    logger.info(f"📊 Scanned: {m['coins_scanned']} | Engines: {m['engine_triggers']} | Vision: {m['vision_calls']} | Alerts: {total}")
+    logger.info(f"📊 Scanned: {m['coins_scanned']} | Engines: {m['engine_triggers']} | Vision: {m['vision_calls']} | Flashcards: {m['flashcard_fetches']} | Alerts: {total}")
 
 def record_vision_rejection(token: dict):
     address = token.get('address', '')
@@ -223,7 +236,15 @@ async def load_training_from_github():
                 content = base64.b64decode(resp.json().get('content', '')).decode()
                 TRAINING_DATA = json.loads(content)
                 TRAINING_LAST_LOADED = datetime.now()
-                logger.info(f"✅ Loaded {len(TRAINING_DATA)} training charts")
+                logger.info(f"✅ Loaded {len(TRAINING_DATA)} training charts from GitHub")
+                
+                # v4.1: Log setup counts
+                setup_counts = {}
+                for t in TRAINING_DATA:
+                    setup = t.get('setup_name', 'Unknown')
+                    setup_counts[setup] = setup_counts.get(setup, 0) + 1
+                for setup, count in setup_counts.items():
+                    logger.info(f"   📚 {setup}: {count} examples")
     except Exception as e:
         logger.error(f"❌ Training load error: {e}")
     return TRAINING_DATA
@@ -241,6 +262,124 @@ def get_pattern_matches(setup_name: str) -> dict:
     if not charts: return {'match_percentage': 0, 'avg_outcome': 0}
     outcomes = [c.get('outcome_percentage', 0) for c in charts if c.get('outcome_percentage', 0) > 0]
     return {'match_percentage': len(charts) * 2, 'avg_outcome': int(sum(outcomes)/len(outcomes)) if outcomes else 0}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.1: FLASHCARD IMAGE FETCHING FROM TELEGRAM
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def download_telegram_image(file_id: str) -> bytes:
+    """Download an image from Telegram using file_id"""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: Get file path from Telegram
+            resp = await client.get(f"https://api.telegram.org/bot{JAYCE_BOT_TOKEN}/getFile?file_id={file_id}")
+            if resp.status_code != 200:
+                return None
+            
+            data = resp.json()
+            if not data.get('ok'):
+                return None
+            
+            file_path = data.get('result', {}).get('file_path', '')
+            if not file_path:
+                return None
+            
+            # Step 2: Download the actual file
+            file_url = f"https://api.telegram.org/file/bot{JAYCE_BOT_TOKEN}/{file_path}"
+            file_resp = await client.get(file_url)
+            if file_resp.status_code == 200:
+                return file_resp.content
+    except Exception as e:
+        logger.error(f"❌ Telegram image download error: {e}")
+    return None
+
+async def get_flashcard_examples(setup_name: str, count: int = 3) -> list:
+    """Get flashcard example images for a specific setup type"""
+    global FLASHCARD_IMAGE_CACHE, FLASHCARD_CACHE_TIMESTAMP
+    
+    # Check if cache needs refresh
+    if FLASHCARD_CACHE_TIMESTAMP:
+        cache_age = (datetime.now() - FLASHCARD_CACHE_TIMESTAMP).total_seconds() / 3600
+        if cache_age >= FLASHCARD_CACHE_HOURS:
+            FLASHCARD_IMAGE_CACHE = {}
+            FLASHCARD_CACHE_TIMESTAMP = None
+    
+    if not TRAINING_DATA:
+        await ensure_training_data()
+    
+    # Filter training data for this setup type
+    matching_charts = [t for t in TRAINING_DATA if t.get('setup_name') == setup_name]
+    if not matching_charts:
+        logger.warning(f"⚠️ No training data for setup: {setup_name}")
+        return []
+    
+    # Sort by outcome percentage (best performers first) and take top examples
+    matching_charts.sort(key=lambda x: x.get('outcome_percentage', 0), reverse=True)
+    
+    # Select diverse examples (mix of high outcome and random)
+    top_performers = matching_charts[:min(5, len(matching_charts))]
+    selected = random.sample(top_performers, min(count, len(top_performers)))
+    
+    examples = []
+    for chart in selected:
+        file_id = chart.get('screenshot_fingerprint_id', '')
+        if not file_id:
+            continue
+        
+        # Check cache first
+        if file_id in FLASHCARD_IMAGE_CACHE:
+            examples.append({
+                'image_bytes': FLASHCARD_IMAGE_CACHE[file_id],
+                'token': chart.get('token', '???'),
+                'outcome': chart.get('outcome_percentage', 0),
+                'notes': chart.get('notes', ''),
+                'setup_name': setup_name,
+            })
+            continue
+        
+        # Download from Telegram
+        image_bytes = await download_telegram_image(file_id)
+        if image_bytes:
+            FLASHCARD_IMAGE_CACHE[file_id] = image_bytes
+            if not FLASHCARD_CACHE_TIMESTAMP:
+                FLASHCARD_CACHE_TIMESTAMP = datetime.now()
+            
+            examples.append({
+                'image_bytes': image_bytes,
+                'token': chart.get('token', '???'),
+                'outcome': chart.get('outcome_percentage', 0),
+                'notes': chart.get('notes', ''),
+                'setup_name': setup_name,
+            })
+            DAILY_METRICS['flashcard_fetches'] += 1
+            logger.info(f"📸 Fetched flashcard: {chart.get('token')} ({setup_name}) — {chart.get('outcome_percentage')}% outcome")
+        
+        await asyncio.sleep(0.3)  # Rate limit
+    
+    return examples
+
+def get_training_context(setup_name: str) -> str:
+    """Get text context about training data for a setup"""
+    if not TRAINING_DATA:
+        return ""
+    
+    charts = [t for t in TRAINING_DATA if t.get('setup_name') == setup_name]
+    if not charts:
+        return ""
+    
+    outcomes = [c.get('outcome_percentage', 0) for c in charts if c.get('outcome_percentage', 0) > 0]
+    avg_outcome = int(sum(outcomes) / len(outcomes)) if outcomes else 0
+    
+    # Collect common notes/patterns
+    all_notes = ' '.join([c.get('notes', '').upper() for c in charts])
+    patterns = []
+    if 'CLEAN STRUCTURE' in all_notes: patterns.append('clean structure')
+    if 'WHALE CONVICTION' in all_notes: patterns.append('whale conviction')
+    if 'RSI DIVERGENCE' in all_notes: patterns.append('RSI divergence')
+    if 'HIGH VOLUME' in all_notes: patterns.append('high volume')
+    if 'WICK ENTRY' in all_notes: patterns.append('wick entry')
+    
+    return f"Trained on {len(charts)} examples with avg {avg_outcome}% outcome. Common patterns: {', '.join(patterns) if patterns else 'various'}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCORING & FILTERS
@@ -425,27 +564,147 @@ async def screenshot_chart(pair_address: str, symbol: str, browser_ctx) -> tuple
         return None, None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VISION AI
+# v4.1: VISION AI WITH FLASHCARD TRAINING
 # ══════════════════════════════════════════════════════════════════════════════
 
-VISION_PROMPT = """Analyze this 5M chart. Is it a Wiz Fib + Flip Zone setup?
-SETUP TYPES: "382 + Flip Zone", "50 + Flip Zone", "618 + Flip Zone", "786 + Flip Zone", "Under-Fib Flip Zone"
-RESPOND IN JSON: {"is_setup": true/false, "setup_type": "...", "confidence": 0-100, "stage": "testing/forming/confirmed", "reasoning": "..."}"""
+def build_flashcard_vision_prompt(setup_name: str, training_context: str, num_examples: int) -> str:
+    """Build the vision prompt that includes flashcard training context"""
+    return f"""You are analyzing a chart to determine if it matches Wiz's trading style.
 
-async def analyze_chart_vision(image_bytes: bytes, symbol: str) -> dict:
-    if not can_use_vision(): return {'is_setup': False, 'confidence': 0}
+SETUP TYPE TO EVALUATE: "{setup_name}"
+
+TRAINING CONTEXT: {training_context}
+
+I'm showing you {num_examples} EXAMPLE FLASHCARD(S) of successful "{setup_name}" setups that Wiz has traded profitably. Study these examples carefully - they represent EXACTLY what a good setup looks like.
+
+After the examples, you'll see the NEW CHART to analyze.
+
+COMPARE the new chart to the flashcard examples and determine:
+1. Does it have similar structure to the examples?
+2. Does it show the same Fib retracement pattern?
+3. Is there a clear flip zone like in the examples?
+4. Would Wiz take this trade based on his trained examples?
+
+RESPOND IN JSON:
+{{
+    "is_setup": true/false,
+    "setup_type": "{setup_name}",
+    "confidence": 0-100,
+    "match_to_training": 0-100,
+    "stage": "testing/forming/confirmed",
+    "reasoning": "Brief explanation comparing to the training examples"
+}}
+
+The "match_to_training" score should reflect how closely this chart resembles the flashcard examples (0 = nothing alike, 100 = perfect match to Wiz's style).
+"""
+
+async def analyze_chart_with_flashcards(image_bytes: bytes, symbol: str, setup_name: str) -> dict:
+    """Analyze chart using flashcard examples as visual references"""
+    if not can_use_vision(): 
+        return {'is_setup': False, 'confidence': 0}
+    
+    try:
+        # Get flashcard examples for this setup type
+        flashcard_examples = await get_flashcard_examples(setup_name, FLASHCARD_EXAMPLES_PER_SETUP)
+        training_context = get_training_context(setup_name)
+        
+        # Build message content with flashcard images + new chart
+        content = []
+        
+        # Add flashcard examples first
+        for i, example in enumerate(flashcard_examples):
+            content.append({
+                "type": "text", 
+                "text": f"📚 TRAINING EXAMPLE {i+1}: {example['token']} — {example['outcome']}% profit — {example['notes']}"
+            })
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(example['image_bytes']).decode()
+                }
+            })
+        
+        # Add separator
+        content.append({
+            "type": "text",
+            "text": f"\n{'═' * 50}\n🔍 NEW CHART TO ANALYZE: {symbol}\n{'═' * 50}"
+        })
+        
+        # Add the new chart to analyze
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": base64.b64encode(image_bytes).decode()
+            }
+        })
+        
+        # Add the prompt
+        prompt = build_flashcard_vision_prompt(setup_name, training_context, len(flashcard_examples))
+        content.append({"type": "text", "text": prompt})
+        
+        # Call Claude Vision
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=600,
+            messages=[{"role": "user", "content": content}]
+        )
+        
+        increment_vision_usage()
+        DAILY_METRICS['vision_calls'] += 1
+        
+        text = response.content[0].text
+        logger.info(f"🧠 Vision+Flashcards ({len(flashcard_examples)} examples): {symbol}")
+        
+        try:
+            return json.loads(text)
+        except:
+            import re
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            return json.loads(m.group()) if m else {'is_setup': False}
+            
+    except Exception as e:
+        logger.error(f"❌ Vision+Flashcards error: {e}")
+        return {'is_setup': False, 'confidence': 0}
+
+async def analyze_chart_vision(image_bytes: bytes, symbol: str, setup_name: str = None) -> dict:
+    """
+    v4.1: Enhanced vision analysis
+    - If engine detected a setup, use flashcard-trained analysis
+    - Otherwise, use basic analysis
+    """
+    if setup_name and TRAINING_DATA:
+        # Use flashcard-trained analysis
+        return await analyze_chart_with_flashcards(image_bytes, symbol, setup_name)
+    
+    # Fallback to basic analysis (no flashcards)
+    if not can_use_vision(): 
+        return {'is_setup': False, 'confidence': 0}
+    
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        
+        basic_prompt = """Analyze this 5M chart. Is it a Wiz Fib + Flip Zone setup?
+SETUP TYPES: "382 + Flip Zone", "50 + Flip Zone", "618 + Flip Zone", "786 + Flip Zone", "Under-Fib Flip Zone"
+RESPOND IN JSON: {"is_setup": true/false, "setup_type": "...", "confidence": 0-100, "stage": "testing/forming/confirmed", "reasoning": "..."}"""
+        
         response = client.messages.create(
             model="claude-sonnet-4-20250514", max_tokens=500,
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": base64.b64encode(image_bytes).decode()}},
-                {"type": "text", "text": f"Token: {symbol}\n{VISION_PROMPT}"}
+                {"type": "text", "text": f"Token: {symbol}\n{basic_prompt}"}
             ]}])
+        
         increment_vision_usage()
         DAILY_METRICS['vision_calls'] += 1
         text = response.content[0].text
-        try: return json.loads(text)
+        
+        try: 
+            return json.loads(text)
         except:
             import re
             m = re.search(r'\{.*\}', text, re.DOTALL)
@@ -455,7 +714,7 @@ async def analyze_chart_vision(image_bytes: bytes, symbol: str) -> dict:
         return {'is_setup': False}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ALERT SYSTEM — v4.0: Includes engine data
+# ALERT SYSTEM — v4.1: Includes flashcard match info
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_alert(token: dict, vision_result: dict, chart_bytes: bytes, tier_name: str, tier_emoji: str, combined_score: float, engine_result: dict = None):
@@ -476,16 +735,27 @@ async def send_alert(token: dict, vision_result: dict, chart_bytes: bytes, tier_
             grade, engine_score, whale, engine_info = '?', 0, '', ''
         
         confidence = vision_result.get('confidence', 0)
+        match_to_training = vision_result.get('match_to_training', 0)  # v4.1
         mc = token.get('market_cap', 0)
         liq = token.get('liquidity', 0)
         h1 = token.get('price_change_1h', 0)
         h24 = token.get('price_change_24h', 0)
+        
+        # v4.1: Add flashcard match indicator
+        flashcard_indicator = ""
+        if match_to_training >= 80:
+            flashcard_indicator = "📚 STRONG MATCH"
+        elif match_to_training >= 60:
+            flashcard_indicator = "📖 Good Match"
+        elif match_to_training >= 40:
+            flashcard_indicator = "📄 Partial Match"
         
         msg = f"""🚨 <b>JAYCE ALERT — {symbol}</b> {tier_emoji} <b>{tier_name}</b> {whale}
 
 <b>Setup:</b> {setup_type}
 <b>Grade:</b> {grade} | <b>Score:</b> {combined_score:.0f}/100
 <b>Engine:</b> {engine_score} | <b>Vision:</b> {confidence}
+{f'<b>Training Match:</b> {match_to_training}% {flashcard_indicator}' if match_to_training else ''}
 
 💰 MC: ${mc:,.0f} | 💧 Liq: ${liq:,.0f}
 📈 1h: {h1:+.1f}% | 24h: {h24:+.1f}%
@@ -504,12 +774,12 @@ async def send_alert(token: dict, vision_result: dict, chart_bytes: bytes, tier_
         
         record_alert_sent(address, setup_type)
         DAILY_METRICS[f'{tier_name.lower()}_alerts'] += 1
-        logger.info(f"✅ Alert: {symbol} — {setup_type} — {tier_emoji} {tier_name}")
+        logger.info(f"✅ Alert: {symbol} — {setup_type} — {tier_emoji} {tier_name} — Training Match: {match_to_training}%")
     except Exception as e:
         logger.error(f"❌ Alert error: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN PROCESS TOKEN — v4.0: Engine + Vision hybrid
+# MAIN PROCESS TOKEN — v4.1: Engine + Flashcard Vision hybrid
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def process_token(token: dict, browser_ctx) -> bool:
@@ -541,16 +811,19 @@ async def process_token(token: dict, browser_ctx) -> bool:
     chart_bytes, candles = await screenshot_chart(pair_address, symbol, browser_ctx)
     if not chart_bytes: return False
     
-    # v4.0: Run WizTheory engine detection
+    # v4.1: Run WizTheory engine detection
     engine_result = None
+    detected_setup = None
     if candles and len(candles) >= 10:
         engine_result = run_detection(token, candles)
         if engine_result:
             DAILY_METRICS['engine_triggers'] += 1
-            logger.info(f"🎯 ENGINE: {symbol} → {engine_result['engine_name']} Grade: {engine_result['grade']}")
+            detected_setup = engine_result.get('engine_name')
+            logger.info(f"🎯 ENGINE: {symbol} → {detected_setup} Grade: {engine_result['grade']}")
     
-    # Vision analysis
-    vision_result = await analyze_chart_vision(chart_bytes, symbol)
+    # v4.1: Vision analysis WITH flashcard training
+    await ensure_training_data()
+    vision_result = await analyze_chart_vision(chart_bytes, symbol, detected_setup)
     
     # Hard block
     blocked, block_reason = hard_block_check(token, vision_result)
@@ -559,18 +832,30 @@ async def process_token(token: dict, browser_ctx) -> bool:
         record_vision_rejection(token)
         return False
     
-    # Scoring: 40% engine + 40% vision + 20% pattern
+    # v4.1: Scoring with training match bonus
     engine_score = engine_result.get('score', 0) if engine_result else 0
     vision_confidence = vision_result.get('confidence', 0)
-    if not vision_result.get('is_setup'): vision_confidence *= 0.3
+    match_to_training = vision_result.get('match_to_training', 0)
     
-    await ensure_training_data()
+    if not vision_result.get('is_setup'): 
+        vision_confidence *= 0.3
+    
+    # v4.1: Boost pattern score based on training match
     setup_name = engine_result.get('engine_name') if engine_result else vision_result.get('setup_type', '')
     pattern_data = get_pattern_matches(setup_name)
-    pattern_score = 40  # Neutral baseline
+    
+    # Pattern score now incorporates training match
+    if match_to_training >= 70:
+        pattern_score = 80  # High match = high pattern score
+    elif match_to_training >= 50:
+        pattern_score = 60
+    elif match_to_training >= 30:
+        pattern_score = 45
+    else:
+        pattern_score = 30  # Low match = lower pattern score
     
     combined_score = calculate_setup_score(engine_score, vision_confidence, pattern_score)
-    logger.info(f"📊 {symbol}: Engine={engine_score} Vision={vision_confidence:.0f} → Combined={combined_score:.0f}")
+    logger.info(f"📊 {symbol}: Engine={engine_score} Vision={vision_confidence:.0f} TrainMatch={match_to_training} Pattern={pattern_score} → Combined={combined_score:.0f}")
     
     # Tier check
     tier_name, tier_emoji, dedup_hours = get_alert_tier(combined_score)
@@ -594,7 +879,7 @@ async def process_token(token: dict, browser_ctx) -> bool:
 async def scan_top_movers(browser_ctx):
     reset_metrics_if_new_day()
     logger.info("═" * 50)
-    logger.info("🔍 SCANNING — v4.0 WIZTHEORY ENGINES")
+    logger.info("🔍 SCANNING — v4.1 WIZTHEORY + FLASHCARD TRAINING")
     
     tokens = await fetch_top_movers()
     alerts = 0
@@ -661,7 +946,10 @@ async def check_telegram_commands():
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="▶️ Scanner RESUMED", parse_mode=ParseMode.HTML)
                 elif text == '/status':
                     m = DAILY_METRICS
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"📊 Scanned: {m['coins_scanned']} | Engines: {m['engine_triggers']} | Vision: {m['vision_calls']}", parse_mode=ParseMode.HTML)
+                    cache_size = len(FLASHCARD_IMAGE_CACHE)
+                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, 
+                        text=f"📊 Scanned: {m['coins_scanned']} | Engines: {m['engine_triggers']} | Vision: {m['vision_calls']}\n📚 Flashcards cached: {cache_size} | Fetched today: {m['flashcard_fetches']}", 
+                        parse_mode=ParseMode.HTML)
         except: pass
         await asyncio.sleep(2)
 
@@ -671,8 +959,9 @@ async def check_telegram_commands():
 
 async def main():
     logger.info("═" * 60)
-    logger.info("🤖 JAYCE SCANNER v4.0 — WIZTHEORY ENGINES")
+    logger.info("🤖 JAYCE SCANNER v4.1 — FLASHCARD TRAINING MODE")
     logger.info(f"   Engines: .382 | .50 | .618 | .786 | Under-Fib")
+    logger.info(f"   Training: {FLASHCARD_EXAMPLES_PER_SETUP} flashcards per analysis")
     logger.info(f"   Weights: Engine={ENGINE_WEIGHT} Vision={VISION_WEIGHT} Pattern={PATTERN_WEIGHT}")
     logger.info("═" * 60)
     
@@ -682,7 +971,10 @@ async def main():
     
     init_database()
     reset_metrics_if_new_day()
+    
+    # v4.1: Load training data at startup
     await load_training_from_github()
+    logger.info(f"📚 Jayce is now studying {len(TRAINING_DATA)} flashcard examples!")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
