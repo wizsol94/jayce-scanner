@@ -639,12 +639,22 @@ async def analyze_chart_with_flashcards(image_bytes: bytes, symbol: str, setup_n
                 "type": "text", 
                 "text": f"📚 TRAINING EXAMPLE {i+1}: {example['token']} — {example['outcome']}% profit — {example['notes']}"
             })
+            
+            # Detect image format from bytes
+            img_bytes = example['image_bytes']
+            if img_bytes[:3] == b'\xff\xd8\xff':
+                media_type = "image/jpeg"
+            elif img_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+                media_type = "image/png"
+            else:
+                media_type = "image/jpeg"  # Default to JPEG
+            
             content.append({
                 "type": "image",
                 "source": {
                     "type": "base64",
-                    "media_type": "image/png",
-                    "data": base64.b64encode(example['image_bytes']).decode()
+                    "media_type": media_type,
+                    "data": base64.b64encode(img_bytes).decode()
                 }
             })
         
