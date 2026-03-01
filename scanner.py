@@ -258,7 +258,11 @@ async def ensure_training_data():
 def get_pattern_matches(setup_name: str) -> dict:
     if not TRAINING_DATA:
         return {'match_percentage': 0, 'avg_outcome': 0}
-    charts = [t for t in TRAINING_DATA if t.get('setup_name') == setup_name]
+    
+    # Normalize the setup name to match training data format
+    normalized_name = normalize_setup_name(setup_name)
+    
+    charts = [t for t in TRAINING_DATA if t.get('setup_name') == normalized_name]
     if not charts: return {'match_percentage': 0, 'avg_outcome': 0}
     outcomes = [c.get('outcome_percentage', 0) for c in charts if c.get('outcome_percentage', 0) > 0]
     return {'match_percentage': len(charts) * 2, 'avg_outcome': int(sum(outcomes)/len(outcomes)) if outcomes else 0}
@@ -307,8 +311,11 @@ async def get_flashcard_examples(setup_name: str, count: int = 3) -> list:
     if not TRAINING_DATA:
         await ensure_training_data()
     
+    # Normalize the setup name to match training data format
+    normalized_name = normalize_setup_name(setup_name)
+    
     # Filter training data for this setup type
-    matching_charts = [t for t in TRAINING_DATA if t.get('setup_name') == setup_name]
+    matching_charts = [t for t in TRAINING_DATA if t.get('setup_name') == normalized_name]
     if not matching_charts:
         logger.warning(f"⚠️ No training data for setup: {setup_name}")
         return []
@@ -358,12 +365,27 @@ async def get_flashcard_examples(setup_name: str, count: int = 3) -> list:
     
     return examples
 
+def normalize_setup_name(setup_name: str) -> str:
+    """Normalize setup name to match training data format
+    Engine outputs: '.382 + Flip Zone' 
+    Training data:  '382 + Flip Zone'
+    """
+    if not setup_name:
+        return setup_name
+    
+    # Remove leading dot if present
+    normalized = setup_name.lstrip('.')
+    return normalized
+
 def get_training_context(setup_name: str) -> str:
     """Get text context about training data for a setup"""
     if not TRAINING_DATA:
         return ""
     
-    charts = [t for t in TRAINING_DATA if t.get('setup_name') == setup_name]
+    # Normalize the setup name to match training data format
+    normalized_name = normalize_setup_name(setup_name)
+    
+    charts = [t for t in TRAINING_DATA if t.get('setup_name') == normalized_name]
     if not charts:
         return ""
     
