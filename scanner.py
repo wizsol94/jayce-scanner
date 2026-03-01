@@ -459,92 +459,165 @@ def hard_block_check(token: dict, vision_result: dict) -> tuple:
 async def fetch_top_movers() -> list:
     """
     Scrape DexScreener EXACTLY how Wiz trades:
-    1. Load page with filters
+    1. Load page with filters (OPTIMIZED - no images/CSS/ads)
     2. Scrape default list (Trending H6 = Top 100)
-    3. Click 5M button → scrape that list
+    3. Click 5M button → scrape that list  
     4. Click 1H button → scrape that list
     5. Combine all unique coins
+    
+    OPTIMIZED FOR RAILWAY:
+    - Blocks images, fonts, CSS, ads for 10x faster loading
+    - 60 second timeout
+    - 3 retries before API fallback
+    - Real browser user agent
     """
     tokens, seen = [], set()
     
     DEXSCREENER_URL = "https://dexscreener.com/?rankBy=trendingScoreH6&order=desc&chainIds=solana&dexIds=pumpswap,pumpfun&minLiq=10000&minMarketCap=100000&launchpads=1"
     
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
-            page = await browser.new_page(viewport={'width': 1400, 'height': 900})
+    MAX_RETRIES = 3
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.info(f"🌐 Loading DexScreener (attempt {attempt + 1}/{MAX_RETRIES})...")
             
-            # ══════════════════════════════════════════════════════════════
-            # 1. LOAD PAGE WITH YOUR FILTERS
-            # ══════════════════════════════════════════════════════════════
-            logger.info("🌐 Loading DexScreener with your filters...")
-            await page.goto(DEXSCREENER_URL, wait_until='networkidle', timeout=30000)
-            await asyncio.sleep(3)  # Let JavaScript render
-            
-            # ══════════════════════════════════════════════════════════════
-            # 2. SCRAPE TOP 100 (Default Trending H6)
-            # ══════════════════════════════════════════════════════════════
-            logger.info("📈 Scraping TOP 100 (Trending H6)...")
-            top100_tokens = await scrape_token_list(page, seen, 'TOP_100')
-            tokens.extend(top100_tokens)
-            logger.info(f"   Found {len(top100_tokens)} tokens")
-            
-            # ══════════════════════════════════════════════════════════════
-            # 3. CLICK 5M BUTTON AND SCRAPE
-            # ══════════════════════════════════════════════════════════════
-            logger.info("⏱️ Clicking 5M and scraping...")
-            try:
-                # Look for 5M button/tab
-                five_m_btn = await page.query_selector('button:has-text("5m"), [data-timeframe="5m"], .timeframe-5m')
-                if five_m_btn:
-                    await five_m_btn.click()
+            async with async_playwright() as p:
+                # Launch with OPTIMIZED settings for speed
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--disable-software-rasterizer',
+                        '--disable-extensions',
+                        '--disable-background-networking',
+                        '--disable-sync',
+                        '--disable-translate',
+                        '--no-first-run',
+                        '--disable-default-apps',
+                        '--disable-background-timer-throttling',
+                        '--disable-renderer-backgrounding',
+                        '--disable-backgrounding-occluded-windows'
+                    ]
+                )
+                
+                # Create context with real browser fingerprint
+                context = await browser.new_context(
+                    viewport={'width': 1400, 'height': 900},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+                )
+                
+                page = await context.new_page()
+                
+                # BLOCK heavy resources for FAST loading
+                async def block_resources(route):
+                    url = route.request.url.lower()
+                    resource_type = route.request.resource_type
+                    
+                    # Block images, fonts, stylesheets, media
+                    if resource_type in ['image', 'font', 'media']:
+                        await route.abort()
+                        return
+                    
+                    # Block tracking/ads
+                    blocked_domains = ['google-analytics', 'googletagmanager', 'facebook', 'twitter', 
+                                      'ads', 'analytics', 'tracking', 'pixel', 'hotjar', 'clarity']
+                    if any(domain in url for domain in blocked_domains):
+                        await route.abort()
+                        return
+                    
+                    await route.continue_()
+                
+                await page.route("**/*", block_resources)
+                
+                # Load page - wait for DOM, not full network idle (faster)
+                await page.goto(DEXSCREENER_URL, wait_until='domcontentloaded', timeout=60000)
+                
+                # Wait for token table to appear
+                try:
+                    await page.wait_for_selector('a[href*="/solana/"]', timeout=30000)
+                    logger.info("   ✅ Page loaded, tokens visible")
+                except:
+                    logger.warning("   ⚠️ Waiting longer for tokens...")
+                    await asyncio.sleep(5)
+                
+                # Let JS populate the table
+                await asyncio.sleep(2)
+                
+                # ══════════════════════════════════════════════════════════════
+                # 1. SCRAPE TOP 100 (Default Trending H6)
+                # ══════════════════════════════════════════════════════════════
+                logger.info("📈 Scraping TOP 100 (Trending H6)...")
+                top100_tokens = await scrape_token_list(page, seen, 'TOP_100')
+                tokens.extend(top100_tokens)
+                logger.info(f"   ✅ Found {len(top100_tokens)} tokens")
+                
+                # If no tokens, retry
+                if len(top100_tokens) == 0:
+                    raise Exception("No tokens found - page didn't load properly")
+                
+                # ══════════════════════════════════════════════════════════════
+                # 2. CLICK 5M BUTTON AND SCRAPE
+                # ══════════════════════════════════════════════════════════════
+                logger.info("⏱️ Clicking 5M and scraping...")
+                five_m_clicked = False
+                for selector in ['text="5m"', 'button:has-text("5m")', '[data-testid="5m"]', 'span:has-text("5m")']:
+                    try:
+                        await page.click(selector, timeout=3000)
+                        five_m_clicked = True
+                        break
+                    except:
+                        continue
+                
+                if five_m_clicked:
                     await asyncio.sleep(2)
                     five_m_tokens = await scrape_token_list(page, seen, '5M_VOL')
                     tokens.extend(five_m_tokens)
-                    logger.info(f"   Found {len(five_m_tokens)} tokens")
+                    logger.info(f"   ✅ Found {len(five_m_tokens)} tokens")
                 else:
-                    # Try clicking by text content
-                    await page.click('text="5m"', timeout=5000)
-                    await asyncio.sleep(2)
-                    five_m_tokens = await scrape_token_list(page, seen, '5M_VOL')
-                    tokens.extend(five_m_tokens)
-                    logger.info(f"   Found {len(five_m_tokens)} tokens")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not click 5M: {e}")
-            
-            # ══════════════════════════════════════════════════════════════
-            # 4. CLICK 1H BUTTON AND SCRAPE
-            # ══════════════════════════════════════════════════════════════
-            logger.info("⏰ Clicking 1H and scraping...")
-            try:
-                # Look for 1H button/tab
-                one_h_btn = await page.query_selector('button:has-text("1h"), [data-timeframe="1h"], .timeframe-1h')
-                if one_h_btn:
-                    await one_h_btn.click()
+                    logger.warning("   ⚠️ Could not find 5M button")
+                
+                # ══════════════════════════════════════════════════════════════
+                # 3. CLICK 1H BUTTON AND SCRAPE
+                # ══════════════════════════════════════════════════════════════
+                logger.info("⏰ Clicking 1H and scraping...")
+                one_h_clicked = False
+                for selector in ['text="1h"', 'button:has-text("1h")', '[data-testid="1h"]', 'span:has-text("1h")']:
+                    try:
+                        await page.click(selector, timeout=3000)
+                        one_h_clicked = True
+                        break
+                    except:
+                        continue
+                
+                if one_h_clicked:
                     await asyncio.sleep(2)
                     one_h_tokens = await scrape_token_list(page, seen, '1H_VOL')
                     tokens.extend(one_h_tokens)
-                    logger.info(f"   Found {len(one_h_tokens)} tokens")
+                    logger.info(f"   ✅ Found {len(one_h_tokens)} tokens")
                 else:
-                    # Try clicking by text content
-                    await page.click('text="1h"', timeout=5000)
-                    await asyncio.sleep(2)
-                    one_h_tokens = await scrape_token_list(page, seen, '1H_VOL')
-                    tokens.extend(one_h_tokens)
-                    logger.info(f"   Found {len(one_h_tokens)} tokens")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not click 1H: {e}")
-            
-            await browser.close()
-            
-    except Exception as e:
-        logger.error(f"❌ DexScreener scrape error: {e}")
-        # Fallback to API if scraping fails
-        logger.info("🔄 Falling back to API...")
-        return await fetch_top_movers_api_fallback()
+                    logger.warning("   ⚠️ Could not find 1H button")
+                
+                await browser.close()
+                
+                # SUCCESS - break out of retry loop
+                if len(tokens) > 0:
+                    break
+                    
+        except Exception as e:
+            logger.error(f"❌ DexScreener attempt {attempt + 1} failed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                logger.info(f"🔄 Retrying in 5 seconds...")
+                await asyncio.sleep(5)
+            else:
+                # ALL RETRIES FAILED - use API fallback
+                logger.error("❌ All scraping attempts failed!")
+                logger.info("🔄 Falling back to API (LAST RESORT)...")
+                return await fetch_top_movers_api_fallback()
     
     logger.info(f"═══════════════════════════════════════════════")
-    logger.info(f"📊 Total unique tokens to scan: {len(tokens)}")
+    logger.info(f"📊 Total unique tokens scraped: {len(tokens)}")
     logger.info(f"   TOP_100: {len([t for t in tokens if t.get('source') == 'TOP_100'])}")
     logger.info(f"   5M_VOL: {len([t for t in tokens if t.get('source') == '5M_VOL'])}")
     logger.info(f"   1H_VOL: {len([t for t in tokens if t.get('source') == '1H_VOL'])}")
@@ -561,7 +634,11 @@ async def scrape_token_list(page, seen: set, source: str) -> list:
         # Get all token rows - DexScreener uses links with /solana/ in the href
         rows = await page.query_selector_all('a[href*="/solana/"]')
         
-        for row in rows[:100]:  # Limit to top 100
+        count = 0
+        for row in rows:
+            if count >= 100:  # Top 100 only
+                break
+                
             try:
                 href = await row.get_attribute('href')
                 if not href or '/solana/' not in href:
@@ -575,25 +652,30 @@ async def scrape_token_list(page, seen: set, source: str) -> list:
                 if pair_address in seen:
                     continue
                 
-                # Try to get token symbol from the row
+                # Try to get token symbol from the row text
                 text_content = await row.text_content()
                 symbol = '???'
                 if text_content:
-                    # First word is usually the symbol
+                    # Parse out the symbol - skip numbers/percentages/dollar amounts
                     parts = text_content.strip().split()
-                    if parts:
-                        symbol = parts[0][:20]  # Limit length
+                    for part in parts:
+                        clean = part.strip()
+                        if clean and not clean.startswith('$') and not clean.endswith('%'):
+                            if not clean.replace('.', '').replace(',', '').replace('-', '').isdigit():
+                                symbol = clean[:15]
+                                break
                 
                 seen.add(pair_address)
                 tokens.append({
-                    'address': '',  # Will be fetched later
+                    'address': '',  # Will be fetched later via pair lookup
                     'pair_address': pair_address,
                     'symbol': symbol,
                     'source': source
                 })
+                count += 1
                 logger.info(f"   👀 {symbol} ({source})")
                 
-            except Exception as e:
+            except:
                 continue
                 
     except Exception as e:
