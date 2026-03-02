@@ -19,7 +19,14 @@ import random
 from engines import run_detection, format_engine_result_text, cleanup_engine_cooldowns
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JAYCE SCANNER v4.1 — WIZTHEORY ENGINES + FLASHCARD TRAINING + VISION
+# JAYCE SCANNER v4.2 — STABILITY + PERFORMANCE BASELINE
+# ══════════════════════════════════════════════════════════════════════════════
+# Changes from v4.1:
+#   1. Performance logging (per-cycle + 24h summary)
+#   2. Heartbeat system (Telegram health checks)
+#   3. Scraping stability (rate limits, retries, pacing)
+#   4. Structured error logging
+#   5. Environment comparison flag (RAILWAY vs VPS)
 # ══════════════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -32,6 +39,13 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
+
+# v4.2: Environment flag for Railway vs VPS comparison
+ENVIRONMENT = os.getenv('ENVIRONMENT', 'railway').upper()
+
+# v4.2: Heartbeat settings
+HEARTBEAT_CHAT_ID = os.getenv('HEARTBEAT_CHAT_ID', TELEGRAM_CHAT_ID)  # Can be separate private channel
+HEARTBEAT_INTERVAL_MINUTES = int(os.getenv('HEARTBEAT_INTERVAL_MINUTES', 10))
 
 # v4.1: Jayce Bot token for accessing flashcard images
 JAYCE_BOT_TOKEN = os.getenv('JAYCE_BOT_TOKEN', '8235602450:AAG9g__NmneEhBTTwcJgiQpqOwZere6FQc0')
@@ -91,16 +105,53 @@ TRAINED_SETUPS = {
 DB_PATH = os.getenv('DB_PATH', '/app/jayce_memory.db')
 ALLOWED_DEXES = {'pumpfun', 'pumpswap'}
 
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.2: PERFORMANCE METRICS — Baseline tracking for Railway vs VPS comparison
+# ══════════════════════════════════════════════════════════════════════════════
+
 DAILY_METRICS = {
-    'date': None, 'coins_scanned': 0, 'coins_passed_prefilter': 0,
-    'vision_calls': 0, 'engine_triggers': 0,
-    'forming_alerts': 0, 'valid_alerts': 0, 'confirmed_alerts': 0,
-    'blocked_no_impulse': 0, 'blocked_choppy': 0, 'blocked_low_score': 0,
-    'blocked_cooldown': 0, 'cooldown_overrides': 0,
-    'blocked_wash_trading': 0, 'blocked_staircase': 0, 'blocked_spike_chop': 0,
-    'blocked_too_new': 0, 'blocked_low_candles': 0,  # v4.2: Age/candle filters
-    'flashcard_fetches': 0,  # v4.1: Track flashcard usage
+    'date': None, 
+    'coins_scanned': 0, 
+    'coins_passed_prefilter': 0,
+    'vision_calls': 0, 
+    'engine_triggers': 0,
+    'forming_alerts': 0, 
+    'valid_alerts': 0, 
+    'confirmed_alerts': 0,
+    'blocked_no_impulse': 0, 
+    'blocked_choppy': 0, 
+    'blocked_low_score': 0,
+    'blocked_cooldown': 0, 
+    'cooldown_overrides': 0,
+    'blocked_wash_trading': 0, 
+    'blocked_staircase': 0, 
+    'blocked_spike_chop': 0,
+    'blocked_too_new': 0, 
+    'blocked_low_candles': 0,
+    'flashcard_fetches': 0,
+    # v4.2: Engine-specific detection counts
+    'engine_382': 0,
+    'engine_50': 0,
+    'engine_618': 0,
+    'engine_786': 0,
+    'engine_underfib': 0,
+    # v4.2: Source category counts
+    'source_top100': 0,
+    'source_5m_vol': 0,
+    'source_1h_vol': 0,
+    # v4.2: Error tracking
+    'errors_playwright': 0,
+    'errors_timeout': 0,
+    'errors_parsing': 0,
+    'errors_other': 0,
+    # v4.2: Performance timing
+    'cycle_times': [],  # List of cycle durations in seconds
+    'cycle_count': 0,
 }
+
+# v4.2: Heartbeat tracking
+LAST_HEARTBEAT = None
+SCANNER_START_TIME = None
 
 VISION_COOLDOWN_CACHE = {}
 TRAINING_DATA = []
@@ -118,16 +169,93 @@ CHOPPY_KEYWORDS = ['choppy', 'no structure', 'no setup', 'messy', 'sideways',
 # ══════════════════════════════════════════════════════════════════════════════
 
 def reset_metrics_if_new_day():
+    """Reset daily metrics at midnight, send 24h summary first"""
     today = datetime.now().strftime('%Y-%m-%d')
     if DAILY_METRICS['date'] != today:
+        # Send 24h summary before resetting (if we have data)
+        if DAILY_METRICS['date'] is not None and DAILY_METRICS['cycle_count'] > 0:
+            asyncio.create_task(send_daily_summary())
+        
         DAILY_METRICS['date'] = today
         for key in DAILY_METRICS:
-            if key != 'date': DAILY_METRICS[key] = 0
+            if key == 'date':
+                continue
+            elif key == 'cycle_times':
+                DAILY_METRICS[key] = []
+            else:
+                DAILY_METRICS[key] = 0
+
+
+async def send_daily_summary():
+    """Send 24-hour performance summary to Telegram"""
+    try:
+        m = DAILY_METRICS
+        total_alerts = m['forming_alerts'] + m['valid_alerts'] + m['confirmed_alerts']
+        
+        # Calculate average cycle time
+        avg_cycle = 0
+        if m['cycle_times']:
+            avg_cycle = sum(m['cycle_times']) / len(m['cycle_times'])
+        
+        summary = f"""📊 <b>[{ENVIRONMENT}] 24H PERFORMANCE SUMMARY</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📅 Date: {m['date']}
+
+<b>SCANNING</b>
+• Tokens scanned: {m['coins_scanned']}
+• Cycles completed: {m['cycle_count']}
+• Avg cycle time: {avg_cycle:.1f}s
+
+<b>SOURCE BREAKDOWN</b>
+• Top 100 H6: {m['source_top100']}
+• 5M Volume: {m['source_5m_vol']}
+• 1H Volume: {m['source_1h_vol']}
+
+<b>ENGINE DETECTIONS</b>
+• .382: {m['engine_382']}
+• .50: {m['engine_50']}
+• .618: {m['engine_618']}
+• .786: {m['engine_786']}
+• Under-Fib: {m['engine_underfib']}
+
+<b>ALERTS SENT</b>
+• Forming: {m['forming_alerts']}
+• Valid: {m['valid_alerts']}
+• Confirmed: {m['confirmed_alerts']}
+• Total: {total_alerts}
+
+<b>ERRORS</b>
+• Playwright: {m['errors_playwright']}
+• Timeout: {m['errors_timeout']}
+• Parsing: {m['errors_parsing']}
+• Other: {m['errors_other']}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+        
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        await bot.send_message(chat_id=HEARTBEAT_CHAT_ID, text=summary, parse_mode=ParseMode.HTML)
+        logger.info(f"[{ENVIRONMENT}] 📊 24h summary sent")
+    except Exception as e:
+        logger.error(f"[{ENVIRONMENT}] ❌ Failed to send daily summary: {e}")
 
 def log_current_metrics():
+    """Log current cycle metrics with environment tag"""
     m = DAILY_METRICS
     total = m['forming_alerts'] + m['valid_alerts'] + m['confirmed_alerts']
-    logger.info(f"📊 Scanned: {m['coins_scanned']} | Engines: {m['engine_triggers']} | Vision: {m['vision_calls']} | Flashcards: {m['flashcard_fetches']} | Alerts: {total}")
+    logger.info(f"[{ENVIRONMENT}] 📊 Scanned: {m['coins_scanned']} | Engines: {m['engine_triggers']} | Vision: {m['vision_calls']} | Flashcards: {m['flashcard_fetches']} | Alerts: {total}")
+
+
+def log_cycle_complete(cycle_time: float, tokens_scanned: int, alerts_sent: int, source_counts: dict):
+    """Log structured cycle completion data"""
+    DAILY_METRICS['cycle_times'].append(cycle_time)
+    DAILY_METRICS['cycle_count'] += 1
+    
+    logger.info(f"""[{ENVIRONMENT}] ═══════════════════════════════════════════════
+[{ENVIRONMENT}] ✅ CYCLE #{DAILY_METRICS['cycle_count']} COMPLETE
+[{ENVIRONMENT}]    Time: {cycle_time:.1f}s
+[{ENVIRONMENT}]    Tokens: {tokens_scanned}
+[{ENVIRONMENT}]    Sources: TOP100={source_counts.get('TOP_100', 0)} | 5M={source_counts.get('5M_VOL', 0)} | 1H={source_counts.get('1H_VOL', 0)}
+[{ENVIRONMENT}]    Alerts: {alerts_sent}
+[{ENVIRONMENT}] ═══════════════════════════════════════════════""")
 
 def record_vision_rejection(token: dict):
     address = token.get('address', '')
@@ -160,6 +288,68 @@ def cleanup_expired_cooldowns():
     expired = [a for a, c in VISION_COOLDOWN_CACHE.items() 
                if (now - c['rejected_at']).total_seconds() / 60 >= VISION_COOLDOWN_MINUTES]
     for addr in expired: del VISION_COOLDOWN_CACHE[addr]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.2: HEARTBEAT SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def send_heartbeat(cycle_time: float = 0):
+    """Send heartbeat to Telegram every HEARTBEAT_INTERVAL_MINUTES"""
+    global LAST_HEARTBEAT
+    
+    now = datetime.now()
+    
+    # Check if heartbeat is due
+    if LAST_HEARTBEAT is not None:
+        minutes_since = (now - LAST_HEARTBEAT).total_seconds() / 60
+        if minutes_since < HEARTBEAT_INTERVAL_MINUTES:
+            return  # Not time yet
+    
+    try:
+        m = DAILY_METRICS
+        total_alerts = m['forming_alerts'] + m['valid_alerts'] + m['confirmed_alerts']
+        uptime = ""
+        if SCANNER_START_TIME:
+            uptime_delta = now - SCANNER_START_TIME
+            hours = int(uptime_delta.total_seconds() // 3600)
+            minutes = int((uptime_delta.total_seconds() % 3600) // 60)
+            uptime = f"\n⏱️ Uptime: {hours}h {minutes}m"
+        
+        heartbeat_msg = f"""🫀 <b>[{ENVIRONMENT}] Scanner Alive</b>
+━━━━━━━━━━━━━━━━━━
+Cycle time: {cycle_time:.1f}s
+Tokens today: {m['coins_scanned']}
+Alerts today: {total_alerts}{uptime}"""
+        
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        await bot.send_message(chat_id=HEARTBEAT_CHAT_ID, text=heartbeat_msg, parse_mode=ParseMode.HTML)
+        LAST_HEARTBEAT = now
+        logger.info(f"[{ENVIRONMENT}] 🫀 Heartbeat sent")
+    except Exception as e:
+        logger.error(f"[{ENVIRONMENT}] ❌ Heartbeat failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.2: STRUCTURED ERROR LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def log_error(error_type: str, message: str, details: dict = None):
+    """Log structured error with environment tag and increment counter"""
+    error_key = f"errors_{error_type}"
+    if error_key in DAILY_METRICS:
+        DAILY_METRICS[error_key] += 1
+    else:
+        DAILY_METRICS['errors_other'] += 1
+    
+    detail_str = f" | Details: {details}" if details else ""
+    logger.error(f"[{ENVIRONMENT}] ❌ [{error_type.upper()}] {message}{detail_str}")
+
+
+def log_scrape_error(error_type: str, url: str, error: Exception):
+    """Log scraping-specific errors"""
+    error_name = type(error).__name__
+    log_error(error_type, f"{error_name} on {url[:50]}...", {'error': str(error)[:100]})
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATABASE
@@ -456,8 +646,36 @@ def hard_block_check(token: dict, vision_result: dict) -> tuple:
     return (False, "OK")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DEXSCREENER API
+# DEXSCREENER API — v4.2: With rate limiting, retries, and error tracking
 # ══════════════════════════════════════════════════════════════════════════════
+
+async def fetch_with_retry(client, url: str, headers: dict, max_retries: int = 2) -> dict:
+    """Fetch URL with retry logic and error tracking"""
+    for attempt in range(max_retries + 1):
+        try:
+            # v4.2: Randomized delay between requests (0.5-1.2 seconds)
+            delay = random.uniform(0.5, 1.2)
+            await asyncio.sleep(delay)
+            
+            resp = await client.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code == 429:  # Rate limited
+                log_error('timeout', f"Rate limited on {url[:50]}", {'status': 429})
+                await asyncio.sleep(5)  # Wait longer on rate limit
+            else:
+                log_error('other', f"HTTP {resp.status_code} on {url[:50]}")
+        except httpx.TimeoutException as e:
+            log_scrape_error('timeout', url, e)
+            if attempt < max_retries:
+                await asyncio.sleep(2)
+        except Exception as e:
+            log_scrape_error('other', url, e)
+            if attempt < max_retries:
+                await asyncio.sleep(1)
+    
+    return {}
+
 
 async def fetch_top_movers() -> list:
     """
@@ -466,15 +684,18 @@ async def fetch_top_movers() -> list:
     2. Parse token data from the page
     3. Get Top 100 (Trending H6)
     
+    v4.2: Added rate limiting, retries, and source tracking
+    
     NOTE: httpx works on Railway while Playwright browser is blocked.
     We fetch the page and parse the embedded JSON data.
     """
     tokens, seen = [], set()
+    source_counts = {'TOP_100': 0, '5M_VOL': 0, '1H_VOL': 0}
     
     DEXSCREENER_URL = "https://dexscreener.com/?rankBy=trendingScoreH6&order=desc&chainIds=solana&dexIds=pumpswap,pumpfun&minLiq=10000&minMarketCap=100000&launchpads=1"
     
     try:
-        logger.info("🌐 Fetching DexScreener data...")
+        logger.info(f"[{ENVIRONMENT}] 🌐 Fetching DexScreener data...")
         
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             # Use headers that look like a real browser
@@ -491,7 +712,7 @@ async def fetch_top_movers() -> list:
             # First, let's try their internal API that powers the frontend
             
             # Method 1: Try the pairs endpoint with ranking
-            logger.info("📈 Fetching TOP 100 (Trending H6)...")
+            logger.info(f"[{ENVIRONMENT}] 📈 Fetching TOP 100 (Trending H6)...")
             
             # DexScreener doesn't have a public sorted API, so we use multiple endpoints
             # and combine + sort ourselves to approximate the Top 100
@@ -500,67 +721,67 @@ async def fetch_top_movers() -> list:
             
             # Get boosted/promoted tokens (these are often in Top 100)
             try:
-                resp = await client.get('https://api.dexscreener.com/token-boosts/top/v1', headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    items = data if isinstance(data, list) else []
-                    for item in items[:30]:
-                        if item.get('chainId') == 'solana':
-                            all_pairs.append({
-                                'address': item.get('tokenAddress', ''),
-                                'symbol': item.get('symbol', '???'),
-                                'pair_address': '',
-                                'source': 'TOP_100',
-                                'boost': True
-                            })
+                data = await fetch_with_retry(client, 'https://api.dexscreener.com/token-boosts/top/v1', headers)
+                items = data if isinstance(data, list) else []
+                for item in items[:30]:
+                    if item.get('chainId') == 'solana':
+                        all_pairs.append({
+                            'address': item.get('tokenAddress', ''),
+                            'symbol': item.get('symbol', '???'),
+                            'pair_address': '',
+                            'source': 'TOP_100',
+                            'boost': True
+                        })
             except Exception as e:
-                logger.warning(f"⚠️ Boost endpoint error: {e}")
+                log_scrape_error('parsing', 'token-boosts endpoint', e)
+            
+            # v4.2: Delay between category fetches
+            await asyncio.sleep(random.uniform(0.8, 1.5))
             
             # Get trending Solana pairs from search
             for query in ['', 'pump', 'sol']:
                 try:
                     url = f'https://api.dexscreener.com/latest/dex/search?q={query}' if query else 'https://api.dexscreener.com/latest/dex/pairs/solana'
-                    resp = await client.get(url, headers=headers)
-                    if resp.status_code == 200:
-                        pairs = resp.json().get('pairs', [])
-                        for pair in pairs[:50]:
-                            if pair.get('chainId') != 'solana':
-                                continue
-                            if pair.get('dexId', '').lower() not in ALLOWED_DEXES:
-                                continue
-                            
-                            addr = pair.get('baseToken', {}).get('address', '')
-                            mc = float(pair.get('marketCap', 0) or 0)
-                            liq = float(pair.get('liquidity', {}).get('usd', 0) or 0)
-                            
-                            if mc < MIN_MARKET_CAP or liq < MIN_LIQUIDITY:
-                                continue
-                            
-                            # Calculate a trending score based on price changes
-                            h1 = abs(float(pair.get('priceChange', {}).get('h1', 0) or 0))
-                            h6 = abs(float(pair.get('priceChange', {}).get('h6', 0) or 0))
-                            h24 = abs(float(pair.get('priceChange', {}).get('h24', 0) or 0))
-                            vol = float(pair.get('volume', {}).get('h24', 0) or 0)
-                            
-                            # Trending score: weight recent activity higher
-                            trending_score = (h1 * 3) + (h6 * 2) + h24 + (vol / 10000)
-                            
-                            all_pairs.append({
-                                'address': addr,
-                                'pair_address': pair.get('pairAddress', ''),
-                                'symbol': pair.get('baseToken', {}).get('symbol', '???'),
-                                'source': 'TOP_100',
-                                'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
-                                'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
-                                'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
-                                'market_cap': mc,
-                                'liquidity': liq,
-                                'volume_24h': vol,
-                                'trending_score': trending_score,
-                                'boost': False
+                    data = await fetch_with_retry(client, url, headers)
+                    pairs = data.get('pairs', []) if data else []
+                    for pair in pairs[:50]:
+                        if pair.get('chainId') != 'solana':
+                            continue
+                        if pair.get('dexId', '').lower() not in ALLOWED_DEXES:
+                            continue
+                        
+                        addr = pair.get('baseToken', {}).get('address', '')
+                        mc = float(pair.get('marketCap', 0) or 0)
+                        liq = float(pair.get('liquidity', {}).get('usd', 0) or 0)
+                        
+                        if mc < MIN_MARKET_CAP or liq < MIN_LIQUIDITY:
+                            continue
+                        
+                        # Calculate a trending score based on price changes
+                        h1 = abs(float(pair.get('priceChange', {}).get('h1', 0) or 0))
+                        h6 = abs(float(pair.get('priceChange', {}).get('h6', 0) or 0))
+                        h24 = abs(float(pair.get('priceChange', {}).get('h24', 0) or 0))
+                        vol = float(pair.get('volume', {}).get('h24', 0) or 0)
+                        
+                        # Trending score: weight recent activity higher
+                        trending_score = (h1 * 3) + (h6 * 2) + h24 + (vol / 10000)
+                        
+                        all_pairs.append({
+                            'address': addr,
+                            'pair_address': pair.get('pairAddress', ''),
+                            'symbol': pair.get('baseToken', {}).get('symbol', '???'),
+                            'source': 'TOP_100',
+                            'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
+                            'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
+                            'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
+                            'market_cap': mc,
+                            'liquidity': liq,
+                            'volume_24h': vol,
+                            'trending_score': trending_score,
+                            'boost': False
                             })
                 except Exception as e:
-                    logger.warning(f"⚠️ Search error for '{query}': {e}")
+                    log_scrape_error('parsing', f'search endpoint ({query})', e)
             
             # Sort by trending score (approximates DexScreener's Trending H6)
             all_pairs.sort(key=lambda x: (x.get('boost', False), x.get('trending_score', 0)), reverse=True)
@@ -571,118 +792,126 @@ async def fetch_top_movers() -> list:
                 if addr and addr not in seen:
                     seen.add(addr)
                     tokens.append(pair)
-                    logger.info(f"   👀 {pair.get('symbol', '???')} (TOP_100)")
+                    source_counts['TOP_100'] += 1
+                    logger.info(f"[{ENVIRONMENT}]    👀 {pair.get('symbol', '???')} (TOP_100)")
                     
                     if len(tokens) >= 100:
                         break
             
-            logger.info(f"   ✅ Found {len(tokens)} tokens")
+            logger.info(f"[{ENVIRONMENT}]    ✅ Found {source_counts['TOP_100']} tokens from TOP 100")
+            
+            # v4.2: Delay between category rotations
+            await asyncio.sleep(random.uniform(1.0, 2.0))
             
             # Now get 5M movers - tokens with biggest 5min price changes
             # We'll use the h1 data and approximate
-            logger.info("⏱️ Fetching 5M volume movers...")
-            five_m_count = 0
+            logger.info(f"[{ENVIRONMENT}] ⏱️ Fetching 5M volume movers...")
             
             try:
-                resp = await client.get('https://api.dexscreener.com/latest/dex/search?q=pumpfun', headers=headers)
-                if resp.status_code == 200:
-                    pairs = resp.json().get('pairs', [])
-                    # Sort by h1 change as proxy for recent activity
-                    pairs.sort(key=lambda x: abs(float(x.get('priceChange', {}).get('h1', 0) or 0)), reverse=True)
+                data = await fetch_with_retry(client, 'https://api.dexscreener.com/latest/dex/search?q=pumpfun', headers)
+                pairs = data.get('pairs', []) if data else []
+                # Sort by h1 change as proxy for recent activity
+                pairs.sort(key=lambda x: abs(float(x.get('priceChange', {}).get('h1', 0) or 0)), reverse=True)
+                
+                for pair in pairs[:30]:
+                    if pair.get('chainId') != 'solana':
+                        continue
+                    if pair.get('dexId', '').lower() not in ALLOWED_DEXES:
+                        continue
                     
-                    for pair in pairs[:30]:
-                        if pair.get('chainId') != 'solana':
-                            continue
-                        if pair.get('dexId', '').lower() not in ALLOWED_DEXES:
-                            continue
+                    addr = pair.get('baseToken', {}).get('address', '')
+                    if addr in seen:
+                        continue
                         
-                        addr = pair.get('baseToken', {}).get('address', '')
-                        if addr in seen:
-                            continue
-                            
-                        mc = float(pair.get('marketCap', 0) or 0)
-                        liq = float(pair.get('liquidity', {}).get('usd', 0) or 0)
-                        
-                        if mc < MIN_MARKET_CAP or liq < MIN_LIQUIDITY:
-                            continue
-                        
-                        seen.add(addr)
-                        tokens.append({
-                            'address': addr,
-                            'pair_address': pair.get('pairAddress', ''),
-                            'symbol': pair.get('baseToken', {}).get('symbol', '???'),
-                            'source': '5M_VOL',
-                            'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
-                            'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
-                            'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
-                            'market_cap': mc,
-                            'liquidity': liq,
-                            'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
-                        })
-                        five_m_count += 1
-                        logger.info(f"   👀 {pair.get('baseToken', {}).get('symbol', '???')} (5M_VOL)")
+                    mc = float(pair.get('marketCap', 0) or 0)
+                    liq = float(pair.get('liquidity', {}).get('usd', 0) or 0)
+                    
+                    if mc < MIN_MARKET_CAP or liq < MIN_LIQUIDITY:
+                        continue
+                    
+                    seen.add(addr)
+                    tokens.append({
+                        'address': addr,
+                        'pair_address': pair.get('pairAddress', ''),
+                        'symbol': pair.get('baseToken', {}).get('symbol', '???'),
+                        'source': '5M_VOL',
+                        'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
+                        'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
+                        'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
+                        'market_cap': mc,
+                        'liquidity': liq,
+                        'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
+                    })
+                    source_counts['5M_VOL'] += 1
+                    logger.info(f"[{ENVIRONMENT}]    👀 {pair.get('baseToken', {}).get('symbol', '???')} (5M_VOL)")
             except Exception as e:
-                logger.warning(f"⚠️ 5M fetch error: {e}")
+                log_scrape_error('parsing', '5M volume endpoint', e)
             
-            logger.info(f"   ✅ Found {five_m_count} tokens")
+            logger.info(f"[{ENVIRONMENT}]    ✅ Found {source_counts['5M_VOL']} tokens from 5M volume")
+            
+            # v4.2: Delay between category rotations
+            await asyncio.sleep(random.uniform(1.0, 2.0))
             
             # Get 1H volume movers
-            logger.info("⏰ Fetching 1H volume movers...")
-            one_h_count = 0
+            logger.info(f"[{ENVIRONMENT}] ⏰ Fetching 1H volume movers...")
             
             try:
-                resp = await client.get('https://api.dexscreener.com/latest/dex/search?q=pumpswap', headers=headers)
-                if resp.status_code == 200:
-                    pairs = resp.json().get('pairs', [])
-                    # Sort by volume as proxy for 1H activity
-                    pairs.sort(key=lambda x: float(x.get('volume', {}).get('h24', 0) or 0), reverse=True)
+                data = await fetch_with_retry(client, 'https://api.dexscreener.com/latest/dex/search?q=pumpswap', headers)
+                pairs = data.get('pairs', []) if data else []
+                # Sort by volume as proxy for 1H activity
+                pairs.sort(key=lambda x: float(x.get('volume', {}).get('h24', 0) or 0), reverse=True)
+                
+                for pair in pairs[:30]:
+                    if pair.get('chainId') != 'solana':
+                        continue
+                    if pair.get('dexId', '').lower() not in ALLOWED_DEXES:
+                        continue
                     
-                    for pair in pairs[:30]:
-                        if pair.get('chainId') != 'solana':
-                            continue
-                        if pair.get('dexId', '').lower() not in ALLOWED_DEXES:
-                            continue
+                    addr = pair.get('baseToken', {}).get('address', '')
+                    if addr in seen:
+                        continue
                         
-                        addr = pair.get('baseToken', {}).get('address', '')
-                        if addr in seen:
-                            continue
-                            
-                        mc = float(pair.get('marketCap', 0) or 0)
-                        liq = float(pair.get('liquidity', {}).get('usd', 0) or 0)
-                        
-                        if mc < MIN_MARKET_CAP or liq < MIN_LIQUIDITY:
-                            continue
-                        
-                        seen.add(addr)
-                        tokens.append({
-                            'address': addr,
-                            'pair_address': pair.get('pairAddress', ''),
-                            'symbol': pair.get('baseToken', {}).get('symbol', '???'),
-                            'source': '1H_VOL',
-                            'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
-                            'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
-                            'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
-                            'market_cap': mc,
-                            'liquidity': liq,
-                            'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
-                        })
-                        one_h_count += 1
-                        logger.info(f"   👀 {pair.get('baseToken', {}).get('symbol', '???')} (1H_VOL)")
+                    mc = float(pair.get('marketCap', 0) or 0)
+                    liq = float(pair.get('liquidity', {}).get('usd', 0) or 0)
+                    
+                    if mc < MIN_MARKET_CAP or liq < MIN_LIQUIDITY:
+                        continue
+                    
+                    seen.add(addr)
+                    tokens.append({
+                        'address': addr,
+                        'pair_address': pair.get('pairAddress', ''),
+                        'symbol': pair.get('baseToken', {}).get('symbol', '???'),
+                        'source': '1H_VOL',
+                        'price_change_1h': float(pair.get('priceChange', {}).get('h1', 0) or 0),
+                        'price_change_6h': float(pair.get('priceChange', {}).get('h6', 0) or 0),
+                        'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0) or 0),
+                        'market_cap': mc,
+                        'liquidity': liq,
+                        'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
+                    })
+                    source_counts['1H_VOL'] += 1
+                    logger.info(f"[{ENVIRONMENT}]    👀 {pair.get('baseToken', {}).get('symbol', '???')} (1H_VOL)")
             except Exception as e:
-                logger.warning(f"⚠️ 1H fetch error: {e}")
+                log_scrape_error('parsing', '1H volume endpoint', e)
             
-            logger.info(f"   ✅ Found {one_h_count} tokens")
+            logger.info(f"[{ENVIRONMENT}]    ✅ Found {source_counts['1H_VOL']} tokens from 1H volume")
             
     except Exception as e:
-        logger.error(f"❌ DexScreener fetch error: {e}")
+        log_error('other', f"DexScreener fetch error: {e}")
         return await fetch_top_movers_api_fallback()
     
-    logger.info(f"═══════════════════════════════════════════════")
-    logger.info(f"📊 Total unique tokens: {len(tokens)}")
-    logger.info(f"   TOP_100: {len([t for t in tokens if t.get('source') == 'TOP_100'])}")
-    logger.info(f"   5M_VOL: {len([t for t in tokens if t.get('source') == '5M_VOL'])}")
-    logger.info(f"   1H_VOL: {len([t for t in tokens if t.get('source') == '1H_VOL'])}")
-    logger.info(f"═══════════════════════════════════════════════")
+    # v4.2: Update daily source metrics
+    DAILY_METRICS['source_top100'] += source_counts['TOP_100']
+    DAILY_METRICS['source_5m_vol'] += source_counts['5M_VOL']
+    DAILY_METRICS['source_1h_vol'] += source_counts['1H_VOL']
+    
+    logger.info(f"[{ENVIRONMENT}] ═══════════════════════════════════════════════")
+    logger.info(f"[{ENVIRONMENT}] 📊 Total unique tokens: {len(tokens)}")
+    logger.info(f"[{ENVIRONMENT}]    TOP_100: {source_counts['TOP_100']}")
+    logger.info(f"[{ENVIRONMENT}]    5M_VOL: {source_counts['5M_VOL']}")
+    logger.info(f"[{ENVIRONMENT}]    1H_VOL: {source_counts['1H_VOL']}")
+    logger.info(f"[{ENVIRONMENT}] ═══════════════════════════════════════════════")
     
     return tokens
 
@@ -1168,7 +1397,21 @@ async def process_token(token: dict, browser_ctx) -> bool:
         if engine_result:
             DAILY_METRICS['engine_triggers'] += 1
             detected_setup = engine_result.get('engine_name')
-            logger.info(f"🎯 ENGINE: {symbol} → {detected_setup} Grade: {engine_result['grade']}")
+            
+            # v4.2: Track engine-specific detections
+            engine_id = engine_result.get('engine_id', '')
+            if engine_id == '382':
+                DAILY_METRICS['engine_382'] += 1
+            elif engine_id == '50':
+                DAILY_METRICS['engine_50'] += 1
+            elif engine_id == '618':
+                DAILY_METRICS['engine_618'] += 1
+            elif engine_id == '786':
+                DAILY_METRICS['engine_786'] += 1
+            elif engine_id == 'underfib':
+                DAILY_METRICS['engine_underfib'] += 1
+            
+            logger.info(f"[{ENVIRONMENT}] 🎯 ENGINE: {symbol} → {detected_setup} Grade: {engine_result['grade']}")
     
     # v4.1: Vision analysis WITH flashcard training
     await ensure_training_data()
@@ -1226,12 +1469,22 @@ async def process_token(token: dict, browser_ctx) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def scan_top_movers(browser_ctx):
+    """Main scanning loop with v4.2 performance tracking"""
+    cycle_start = datetime.now()
     reset_metrics_if_new_day()
-    logger.info("═" * 50)
-    logger.info("🔍 SCANNING — v4.1 WIZTHEORY + FLASHCARD TRAINING")
+    
+    logger.info(f"[{ENVIRONMENT}] " + "═" * 50)
+    logger.info(f"[{ENVIRONMENT}] 🔍 SCANNING — v4.2 STABILITY + BASELINE")
     
     tokens = await fetch_top_movers()
     alerts = 0
+    
+    # Track source counts for this cycle
+    source_counts = {
+        'TOP_100': len([t for t in tokens if t.get('source') == 'TOP_100']),
+        '5M_VOL': len([t for t in tokens if t.get('source') == '5M_VOL']),
+        '1H_VOL': len([t for t in tokens if t.get('source') == '1H_VOL']),
+    }
     
     for token in tokens:
         if not ALERTS_ENABLED: break
@@ -1248,16 +1501,22 @@ async def scan_top_movers(browser_ctx):
         try:
             if await process_token(token, browser_ctx): alerts += 1
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
+            log_error('other', f"Process token error: {e}")
         await asyncio.sleep(2)
     
-    logger.info(f"✅ Scan done — {alerts} alerts")
+    # v4.2: Calculate cycle time and log structured data
+    cycle_time = (datetime.now() - cycle_start).total_seconds()
+    log_cycle_complete(cycle_time, len(tokens), alerts, source_counts)
     log_current_metrics()
+    
+    # v4.2: Send heartbeat (will only send if interval has passed)
+    await send_heartbeat(cycle_time)
+
 
 async def scan_watchlist(browser_ctx):
     watchlist = get_watchlist()
     if not watchlist: return
-    logger.info(f"👀 Checking {len(watchlist)} watchlist tokens")
+    logger.info(f"[{ENVIRONMENT}] 👀 Checking {len(watchlist)} watchlist tokens")
     for token in watchlist:
         if not ALERTS_ENABLED: break
         data = await fetch_token_data(token['address'])
@@ -1322,15 +1581,19 @@ async def check_telegram_commands():
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def main():
-    logger.info("═" * 60)
-    logger.info("🤖 JAYCE SCANNER v4.1 — FLASHCARD TRAINING MODE")
-    logger.info(f"   Engines: .382 | .50 | .618 | .786 | Under-Fib")
-    logger.info(f"   Training: {FLASHCARD_EXAMPLES_PER_SETUP} flashcards per analysis")
-    logger.info(f"   Weights: Engine={ENGINE_WEIGHT} Vision={VISION_WEIGHT} Pattern={PATTERN_WEIGHT}")
-    logger.info("═" * 60)
+    global SCANNER_START_TIME
+    SCANNER_START_TIME = datetime.now()
+    
+    logger.info(f"[{ENVIRONMENT}] " + "═" * 60)
+    logger.info(f"[{ENVIRONMENT}] 🤖 JAYCE SCANNER v4.2 — STABILITY + BASELINE")
+    logger.info(f"[{ENVIRONMENT}]    Environment: {ENVIRONMENT}")
+    logger.info(f"[{ENVIRONMENT}]    Engines: .382 | .50 | .618 | .786 | Under-Fib")
+    logger.info(f"[{ENVIRONMENT}]    Heartbeat: Every {HEARTBEAT_INTERVAL_MINUTES} min")
+    logger.info(f"[{ENVIRONMENT}]    Weights: Engine={ENGINE_WEIGHT} Vision={VISION_WEIGHT} Pattern={PATTERN_WEIGHT}")
+    logger.info(f"[{ENVIRONMENT}] " + "═" * 60)
     
     if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANTHROPIC_API_KEY]):
-        logger.error("❌ Missing env vars!")
+        logger.error(f"[{ENVIRONMENT}] ❌ Missing env vars!")
         return
     
     init_database()
@@ -1338,7 +1601,18 @@ async def main():
     
     # v4.1: Load training data at startup
     await load_training_from_github()
-    logger.info(f"📚 Jayce is now studying {len(TRAINING_DATA)} flashcard examples!")
+    logger.info(f"[{ENVIRONMENT}] 📚 Jayce is now studying {len(TRAINING_DATA)} flashcard examples!")
+    
+    # v4.2: Send startup heartbeat
+    try:
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        await bot.send_message(
+            chat_id=HEARTBEAT_CHAT_ID, 
+            text=f"🚀 <b>[{ENVIRONMENT}] Scanner Started</b>\nv4.2 Stability + Baseline Mode\nHeartbeat every {HEARTBEAT_INTERVAL_MINUTES} min", 
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"[{ENVIRONMENT}] ❌ Startup message failed: {e}")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
